@@ -22,13 +22,13 @@ flowchart TD
         D --> F[RAG Pipeline]
         E --> G[(MySQL)]
         F --> H[(Chroma Vector DB)]
-        D -.uses.-> I[Gemini Models]
-        E -.uses.-> I
-        F -.uses.-> I
+        D --> I[Gemini Models]
+        E --> I
+        F --> I
     end
 
-    subgraph Ingestion["Automated Ingestion / Data Update Path"]
-        K[Drive / Gmail / Boston.gov] --> J[Ingestion Jobs]
+    subgraph Ingestion["Offline Ingestion / Data Update Path"]
+        K[Drive / Gmail / Boston Open Data] --> J[Ingestion Jobs]
         J --> G
         J --> H
     end
