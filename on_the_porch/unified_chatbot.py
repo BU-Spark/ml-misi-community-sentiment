@@ -21,6 +21,7 @@ if str(_RAG_DIR) not in sys.path:
 
 # Import RAG retrieval helpers; import SQL pipeline lazily only when needed
 import retrieval  # type: ignore  # noqa: E402
+import boston_gov  # type: ignore  # noqa: E402
 
 # Local Gemini client config (avoid importing app3 at module load)
 try:
@@ -29,8 +30,25 @@ except Exception:  # pragma: no cover
     genai = None  # type: ignore
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 GEMINI_SUMMARY_MODEL = os.getenv("GEMINI_SUMMARY_MODEL", GEMINI_MODEL)
+FALLBACK_TRIGGER_PREFIX = "i did not find exact information"
+SQL_FALLBACK_TRIGGER_PHRASES = (
+    FALLBACK_TRIGGER_PREFIX,
+    "i don't see",
+    "i do not see",
+    "i don't currently see",
+    "i do not currently see",
+    "i couldn't find",
+    "i could not find",
+)
+BOSTON_GOV_BOILERPLATE_PATTERNS = (
+    "search results below",
+    "links to relevant pages",
+    "links to relevant",
+    "relevant pages and more information",
+    "find links",
+)
 
 
 def _bootstrap_env() -> None:
@@ -57,6 +75,170 @@ def _get_llm_client():
     if api_key:
         genai.configure(api_key=api_key)
     return genai
+
+
+def _should_trigger_boston_gov_fallback(answer: str) -> bool:
+    if not answer:
+        return False
+    first_two_lines = [line.strip() for line in answer.splitlines() if line.strip()][:2]
+    return any(FALLBACK_TRIGGER_PREFIX in line.lower() for line in first_two_lines)
+
+
+def _should_trigger_sql_fallback(answer: str) -> bool:
+    if not answer:
+        return False
+    first_two_lines = [line.strip().lower() for line in answer.splitlines() if line.strip()][:2]
+    sentence_text = " ".join(first_two_lines)
+    return any(phrase in sentence_text for phrase in SQL_FALLBACK_TRIGGER_PHRASES)
+
+
+def _clean_boston_gov_fallback_text(text: str) -> str:
+    """Remove Boston.gov search UI boilerplate before exposing text to users."""
+    cleaned_lines: List[str] = []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if any(pattern in lowered for pattern in BOSTON_GOV_BOILERPLATE_PATTERNS):
+            continue
+        cleaned_lines.append(stripped)
+    return "\n".join(cleaned_lines).strip()
+
+
+def _classify_boston_gov_exact_match(question: str, page_text: str) -> bool:
+    excerpt = (page_text or "").strip()[:4000]
+    if not excerpt:
+        return False
+
+    client = _get_llm_client()
+    model = client.GenerativeModel(GEMINI_MODEL)
+    system_prompt = (
+        "You are a relevance classifier.\n"
+        "Your task is to decide whether the provided Boston.gov AI answer answers the user's question well enough to be used as the main answer.\n"
+        "Return only one word: yes or no.\n"
+        "Do not be overly strict.\n"
+        "Return yes if the answer is clearly relevant, substantially answers the question, or provides the practical information the user is looking for, even if it is not a perfect exact match.\n"
+        "Return no only if the answer is mostly unrelated, too vague, or missing the key information needed to answer the question."
+    )
+    user_prompt = (
+        "Question:\n"
+        f"{question}\n\n"
+        "Boston.gov AI answer:\n"
+        f"{excerpt}\n\n"
+        "Does this AI answer answer the user's question well enough to be used as the main answer?"
+    )
+
+    try:
+        resp = model.generate_content(
+            system_prompt + "\n\n" + user_prompt,
+            generation_config={"temperature": 0},
+        )
+        label = (resp.text or "").strip().lower()
+        print(f"  🤖 Boston.gov fallback classifier: {label!r}")
+        return label == "yes"
+    except Exception as exc:
+        print(f"  ⚠️ Boston.gov fallback classifier failed: {exc}")
+        return False
+
+
+def _regenerate_with_boston_gov_context(question: str, original_answer: str, ai_text: str) -> str:
+    client = _get_llm_client()
+    model = client.GenerativeModel(GEMINI_MODEL)
+    system_prompt = (
+        "You are a friendly, non-technical assistant helping people understand Dorchester community information.\n"
+        "You are revising an answer using two temporary context sources:\n"
+        "1. The assistant's original answer.\n"
+        "2. A related Boston.gov AI answer.\n\n"
+        "Write one clean final answer for the user.\n"
+        "Use the Boston.gov information only as supporting context when it is relevant.\n"
+        "Do not claim Boston.gov directly answers the question if it does not.\n"
+        "Remove search-page boilerplate such as references to links, relevant pages, or search results below.\n"
+        "Do not mention internal tools, fallback logic, classifiers, or vector databases.\n"
+        "If the exact answer is still not available, say so clearly and then share the most helpful related information."
+    )
+    user_prompt = (
+        "Question:\n"
+        f"{question}\n\n"
+        "Original assistant answer:\n"
+        f"{original_answer}\n\n"
+        "Related Boston.gov AI answer:\n"
+        f"{ai_text[:4000]}\n\n"
+        "Please produce a single/combined improved answer for the user:"
+    )
+    try:
+        resp = model.generate_content(
+            system_prompt + "\n\n" + user_prompt,
+            generation_config={"temperature": 0.2},
+        )
+        regenerated = (resp.text or "").strip()
+        if regenerated:
+            print("  🤖 Boston.gov fallback: regenerated final answer using original + Boston.gov context")
+            return regenerated
+    except Exception as exc:
+        print(f"  ⚠️ Boston.gov fallback regeneration failed: {exc}")
+    return original_answer
+
+
+def _build_boston_gov_fallback_answer(question: str, original_answer: str) -> str:
+    print("  🏛️ Boston.gov fallback: trigger detected from model answer")
+    ai_result = boston_gov.get_boston_gov_ai_answer(question)
+    ai_text = str(ai_result.get("text", "") or "").strip()
+    search_url = ai_result.get("search_url", "")
+
+    # Prefer the first real link from the AI summary; fall back to search URL
+    scraped_links = ai_result.get("links", []) or []
+    primary_link = ""
+    for link_obj in scraped_links:
+        href = (link_obj.get("href") or "").strip()
+        if href and href.startswith(("http://", "https://", "/")):
+            if href.startswith("/"):
+                href = f"https://www.boston.gov{href}"
+            primary_link = href
+            break
+    if not primary_link:
+        primary_link = search_url
+
+    if not ai_text:
+        print("  ⚠️ Boston.gov fallback: no AI answer text found")
+        return original_answer
+    cleaned_ai_text = _clean_boston_gov_fallback_text(ai_text)
+    if not cleaned_ai_text:
+        print("  ⚠️ Boston.gov fallback: AI answer only contained boilerplate")
+        return original_answer
+
+    print("  🏛️ Boston.gov fallback: scraped AI answer text:")
+    for line in cleaned_ai_text.splitlines():
+        if line.strip():
+            print(f"     {line}")
+    print(f"  🔗 Boston.gov fallback: using link {primary_link}")
+
+    excerpt = cleaned_ai_text[:2000].strip()
+    is_exact_match = _classify_boston_gov_exact_match(question, ai_text)
+    if is_exact_match:
+        try:
+            boston_gov.add_boston_gov_answer_to_vectordb(
+                question,
+                cleaned_ai_text,
+                link=primary_link,
+            )
+        except Exception as exc:
+            print(f"  ⚠️ Boston.gov fallback vectordb save failed: {exc}")
+        return excerpt
+    print("  ⚠️ Boston.gov fallback: classifier said scraped AI answer is not an exact match")
+    return _regenerate_with_boston_gov_context(question, original_answer, cleaned_ai_text)
+
+
+def _apply_default_fallback_if_needed(question: str, answer: str) -> str:
+    if not _should_trigger_boston_gov_fallback(answer):
+        return answer
+    return _build_boston_gov_fallback_answer(question, answer)
+
+
+def _apply_sql_fallback_if_needed(question: str, answer: str) -> str:
+    if not _should_trigger_sql_fallback(answer):
+        return answer
+    return _build_boston_gov_fallback_answer(question, answer)
 
 
 def _safe_json_loads(text: str, default: Dict[str, Any]) -> Dict[str, Any]:
@@ -192,19 +374,22 @@ def _check_if_needs_new_data(
     cache_summary = summarize_cache(retrieval_cache)
     
     system_prompt = (
-        "You analyze if a user's question can be answered from conversation history and/or cached retrieval data, or if it needs new data retrieval.\n\n"
-        "You have access to:\n"
-        "1. Conversation history (previous Q&A exchanges)\n"
-        "2. Cached data (the actual data rows/chunks from the most recent retrieval)\n\n"
-        "Rules:\n"
-        "- If the cached data contains the information needed to answer the question → needs_new_data = false\n"
-        "- If question is a follow-up asking for more detail about items in the cached data (e.g., 'tell me more about event #2', 'what about the first one') → needs_new_data = false\n"
-        "- If question is a follow-up, clarification, or reference to previous answers → needs_new_data = false\n"
-        "- If question asks for new data, different time period not in cache, different metrics, or completely new topic → needs_new_data = true\n"
-        "- If question references specific items visible in the cached data preview → needs_new_data = false\n"
-        "- If question asks to compare, explain, or provide more detail on cached data → needs_new_data = false\n\n"
-        "Return ONLY valid JSON with keys: needs_new_data (boolean) and reason (brief string explaining your decision)."
-    )
+    "You analyze if a user's question can be answered from conversation history and/or cached retrieval data, or if it needs new data retrieval.\n\n"
+    "You have access to:\n"
+    "1. Conversation history (previous Q&A exchanges)\n"
+    "2. Cached data (the actual data rows/chunks from the most recent retrieval)\n\n"
+    "CRITICAL RULES (check these FIRST):\n"
+    "- If the question names a specific event, person, place, or entity by name, and that exact name is NOT visibly present in the cached data or conversation history → needs_new_data = true\n"
+    "- If the question references a specific date, day of the week, or time period (e.g., 'April 25', 'this Saturday', 'tomorrow', 'next week') and the cached data does not already contain matching data for that date → needs_new_data = true\n"
+    "- If the question asks for factual details (location, time, description, contact info, schedule) about an entity and those specific details are NOT in the cache → needs_new_data = true\n\n"
+    "Only after checking the critical rules above, apply these:\n"
+    "- If the cached data contains the information needed to answer the question → needs_new_data = false\n"
+    "- If question is a pure follow-up referencing items already shown in the cache (e.g., 'the second one', 'the one in Dorchester') AND that item is visible in the cache → needs_new_data = false\n"
+    "- If question is a clarification or rephrasing of a previous answer → needs_new_data = false\n"
+    "- If question asks for new data, different time period not in cache, different metrics, or a completely new topic → needs_new_data = true\n\n"
+    "When in doubt, prefer needs_new_data = true. It is much worse to answer with stale or missing data than to fetch fresh data.\n\n"
+    "Return ONLY valid JSON with keys: needs_new_data (boolean) and reason (brief string explaining your decision)."
+)
     
     user_prompt = (
         "Conversation History:\n" + (history_context if history_context else "(No previous conversation)") + "\n\n"
@@ -255,11 +440,17 @@ def _route_question(question: str) -> Dict[str, Any]:
     system_prompt = (
         f"Today's date is {date.today().strftime('%A, %B %d, %Y')}.\n\n"
         "You are a STRICT routing classifier for a chatbot that combines SQL (structured data) and RAG (text documents).\n"
+        "RAG includes transcripts, policy documents, RSS/news items, and cached Boston.gov answers.\n"
+        "Whenever a question is routed to RAG or hybrid, cached Boston.gov answers will be searched along with the other RAG sources.\n"
         "You MUST classify the user's question into EXACTLY one of three modes: 'sql', 'rag', or 'hybrid'.\n"
         "These rules are MANDATORY and NON-NEGOTIABLE. Follow them EXACTLY.\n\n"
         "═══════════════════════════════════════════════════════════════════════════════\n"
         "CRITICAL ROUTING RULES - ABSOLUTE PRIORITY (CHECK IN THIS ORDER):\n"
         "═══════════════════════════════════════════════════════════════════════════════\n\n"
+        "RULE 0: NEIGHBORHOOD NEWS / RSS QUESTIONS → 'rag' or 'hybrid'\n"
+        "   - If question uses phrases like 'what's going on in [neighborhood]', 'what's new in', 'lately', 'recent news about', 'updates from [neighborhood]', 'what's happening in [neighborhood]' without asking for specific event schedules\n"
+        "   - AND does not mention a specific day/week/date → mode MUST be 'hybrid' (SQL for 311 activity + RAG for RSS news)\n"
+        "   - If question explicitly names a feed source (Dorchester Reporter, CSNDC, etc.) → mode MUST be 'rag'\n\n"
         "RULE 1: CRIME-RELATED QUESTIONS → Route based on question type\n"
         "   - If the question mentions ANY of: crime, crimes, arrest, arrests, offense, offenses, homicide, homicides, shooting, shootings, shots fired, safety incident, safety incidents, criminal activity, violence, violent\n"
         "   - THEN apply these sub-rules:\n"
@@ -271,6 +462,7 @@ def _route_question(question: str) -> Dict[str, Any]:
         "        Examples: 'How many homicides and what concerns come up?', 'Show crime trends and community concerns' → hybrid\n"
         "   - DO NOT use 'rag' alone for crime questions\n\n"
         "RULE 2: EVENT/CALENDAR/ACTIVITY QUESTIONS → ALWAYS 'sql' mode\n"
+        "   - If the question contains the word 'event' or 'events' anywhere, mode MUST be 'sql' no matter what.\n"
         "   - If the question mentions ANY of: event, events, happening, schedule, calendar, activity, activities, 'what's on', 'what is on', 'going on', meeting, meetings, workshop, workshops, 'this week', 'next week', 'today', 'tomorrow', 'weekend', day of week\n"
         "   - THEN mode MUST be 'sql' (NO EXCEPTIONS)\n"
         "   - DO NOT use 'rag' or 'hybrid' for event/calendar questions\n"
@@ -397,6 +589,15 @@ def _route_question(question: str) -> Dict[str, Any]:
     if k > 20:
         k = 20
 
+    print("Initial routing plan from LLM:", {"mode": mode, "transcript_tags": tags, "policy_sources": sources, "folder_categories": folders, "k": k})
+    if _looks_like_rss_query(question):
+        if _question_mentions_rss_source(question):
+            mode = "rag"
+        elif mode == "sql":
+            mode = "hybrid"
+        if not folders:
+            folders = ["newsletters"]
+        print("Final routing plan from LLM:", {"mode": mode, "transcript_tags": tags, "policy_sources": sources, "folder_categories": folders, "k": k})
     return {
         "mode": mode,
         "transcript_tags": tags if isinstance(tags, list) or tags is None else None,
@@ -419,7 +620,7 @@ def _compose_rag_answer(question: str, chunks: List[str], metadatas: List[Dict[s
             tags_str = ", ".join(tags)
         else:
             tags_str = str(tags)
-        context_parts.append(f"[Source {idx}: {source} ({doc_type}){' - Tags: ' + tags_str if tags_str else ''}]")
+        context_parts.append(f"[{source}]")
         context_parts.append(chunk)
         context_parts.append("")
     context = "\n".join(context_parts)
@@ -429,12 +630,16 @@ def _compose_rag_answer(question: str, chunks: List[str], metadatas: List[Dict[s
         "This system is configured for DORCHESTER ONLY. All data queries are automatically filtered to Dorchester only.\n"
         "Use clear, everyday language and imagine you are talking to a neighbor, not a technical expert.\n"
         "Use only the provided SOURCES and do not add information that is not supported by the text.\n\n"
-        "When you quote or paraphrase people or documents, briefly explain who or what they are first, "
-        "then include the quote in a natural way. Avoid technical jargon, and do not mention SQL, databases, RAG, "
+        "If the sources do not contain the user's exact answer, the first line of your response must begin with "
+        "'I did not find exact information about ...' and briefly name the missing topic. After that first line, "
+        "you may share closely related information from the sources if it is helpful.\n"
+        "When you cite sources, use the source name naturally in the sentence (e.g. 'According to CSNDC...'). "
+        "Do not use numbered source citations like (Source 1). Avoid technical jargon, and do not mention SQL, databases, RAG, "
         "retrieval methods, or internal tools.\n"
         "If the question involves numbers, be honest when the sources are limited and avoid inventing precise figures.\n"
         + ("\n\nYou are in a conversation. Use previous messages for context when the current question references earlier topics or asks for follow-ups." if conversation_history else "")
     )
+
     user_prompt = (
         "SOURCES:\n" + context + "\n\n" +
         "QUESTION: " + question + "\n\n" +
@@ -495,7 +700,9 @@ def _answer_from_history(
         "If the question asks about specific items (e.g., 'tell me more about event #2', 'what about the first one'), "
         "use the cached data to provide detailed information about those specific items.\n"
         "If the question references previous answers, numbers, or statistics, use those in your response.\n"
-        "If you cannot answer from the available information, politely say so and suggest they ask a new question.\n"
+        "If you cannot answer the user's exact question from the available information, the first line of your response must begin "
+        "with 'I did not find exact information about ...' and briefly name the missing topic. After that first line, you may share "
+        "closely related information from the available context if it helps.\n"
         "Avoid technical jargon, and do not mention SQL, databases, RAG, retrieval methods, or internal tools."
     )
     
@@ -583,16 +790,123 @@ def _is_calendar_question(question: str) -> bool:
     return any(kw in question_lower for kw in calendar_keywords)
 
 
-def _run_rag(question: str, plan: Dict[str, Any], conversation_history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+_RSS_SOURCE_ALIASES = (
+    "dot reporter",
+    "dotnews",
+    "csndc",
+    "codman square neighborhood development corporation",
+    "codman square library",
+    "bpl codman square",
+    "codman square health center",   
+    "codman.org",                   
+    "codman square neighborhood council", 
+    "codman council"
+    "south dorchester",                
+)
+
+_RSS_NEWS_HINTS = (
+    "what's new",
+    "whats new",
+    "recent news",
+    "latest news",
+    "news about",
+    "news from",
+    "updates from",
+    "recent updates",
+    "what's going on in",
+    "whats going on in",
+    "what's happening in",
+    "whats happening in",
+    "what is happening in",
+    "what is going on in",
+    "lately in",
+    "dorchester",
+    "south dorchester",
+    "codman square",
+    "csndc",
+    "tell me about",
+    "what has",
+    "who is",
+    "what is",
+)
+_SCHEDULE_HINTS = (
+    "event",
+    "events",
+    "calendar",
+    "schedule",
+    "meeting",
+    "meetings",
+    "workshop",
+    "workshops",
+    "today",
+    "tomorrow",
+    "this week",
+    "next week",
+    "weekend",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
+
+
+def _question_mentions_rss_source(question: str) -> bool:
+    question_lower = (question or "").lower()
+    if "event" in question_lower:
+        return False
+    return any(alias in question_lower for alias in _RSS_SOURCE_ALIASES)
+
+
+def _looks_like_rss_query(question: str) -> bool:
+    question_lower = (question or "").lower()
+    if _question_mentions_rss_source(question):
+        return True
+    if any(hint in question_lower for hint in _RSS_NEWS_HINTS):
+        return not any(schedule_hint in question_lower for schedule_hint in _SCHEDULE_HINTS)
+    return False
+
+
+def _should_include_rss(question: str, folder_categories: Optional[List[str]]) -> bool:
+    normalized = {str(value).strip().lower() for value in (folder_categories or []) if value}
+    return "newsletters" in normalized or _looks_like_rss_query(question)
+
+
+def _run_rag(
+    question: str,
+    plan: Dict[str, Any],
+    conversation_history: Optional[List[Dict[str, str]]] = None,
+    apply_fallback: bool = True,
+) -> Dict[str, Any]:
     k = int(plan.get("k", 5))
     tags = plan.get("transcript_tags")
     sources = plan.get("policy_sources")
+    folders = plan.get("folder_categories") if isinstance(plan.get("folder_categories"), list) else None
 
     combined_chunks: List[str] = []
     combined_meta: List[Dict[str, Any]] = []
 
-    # NOTE: Calendar events are now SQL-only (weekly_events table), not in vector DB.
-    # Event queries should use 'sql' or 'hybrid' mode which handles them via SQL.
+    if _should_include_rss(question, folders):
+        try:
+            rss_res = retrieval.retrieve_rss(question, k=k)
+            rss_chunks = rss_res.get("chunks", [])
+            print(f"  📰 RSS: {len(rss_chunks)} chunks found")
+            combined_chunks.extend(rss_chunks)
+            combined_meta.extend(rss_res.get("metadata", []))
+        except Exception as e:
+            print(f"  ⚠️ RSS retrieval error: {e}")
+
+    # cached Boston.gov answers are a regular RAG source; search them on every RAG pass.
+    try:
+        boston_res = retrieval.retrieve(question, k=k, doc_type="boston_gov_answer")
+        boston_chunks = boston_res.get("chunks", [])
+        print(f"  🏛️ BostonGov: {len(boston_chunks)} chunks found")
+        combined_chunks.extend(boston_chunks)
+        combined_meta.extend(boston_res.get("metadata", []))
+    except Exception as e:
+        print(f"  ⚠️ BostonGov retrieval error: {e}")
 
     # transcripts
     try:
@@ -621,10 +935,16 @@ def _run_rag(question: str, plan: Dict[str, Any], conversation_history: Optional
         print(f"  ⚠️ Policy retrieval error: {e}")
 
     answer = _compose_rag_answer(question, combined_chunks, combined_meta, conversation_history)
+    if apply_fallback:
+        answer = _apply_default_fallback_if_needed(question, answer)
     return {"answer": answer, "chunks": combined_chunks, "metadata": combined_meta}
 
 
-def _run_sql(question: str, conversation_history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+def _run_sql(
+    question: str,
+    conversation_history: Optional[List[Dict[str, str]]] = None,
+    apply_fallback: bool = True,
+) -> Dict[str, Any]:
     # Import app4 (MySQL) only when SQL path is actually used
     import sql_chat.app4 as app4  # noqa: WPS433
 
@@ -681,12 +1001,14 @@ def _run_sql(question: str, conversation_history: Optional[List[Dict[str, str]]]
         os.getenv("GEMINI_SUMMARY_MODEL", getattr(app4, "GEMINI_SUMMARY_MODEL", GEMINI_SUMMARY_MODEL)),
         conversation_history,
     )
+    if apply_fallback:
+        answer = _apply_sql_fallback_if_needed(question, answer)
     return {"answer": answer, "sql": final_sql, "result": result}
 
 
 def _run_hybrid(question: str, plan: Dict[str, Any], conversation_history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
-    sql_part = _run_sql(question, conversation_history)
-    rag_part = _run_rag(question, plan, conversation_history)
+    sql_part = _run_sql(question, conversation_history, apply_fallback=False)
+    rag_part = _run_rag(question, plan, conversation_history, apply_fallback=False)
 
     # Merge with a short LLM call
     client = _get_llm_client()
@@ -700,6 +1022,9 @@ def _run_hybrid(question: str, plan: Dict[str, Any], conversation_history: Optio
         "Blend the numbers with the context so the user understands both what is happening and why it matters.\n"
         "Focus on what the information means for people in Dorchester, not on technical details or data sources.\n"
         "If you see any data from other neighborhoods, ignore it completely and only discuss Dorchester.\n\n"
+        "If the inputs do not contain the user's exact answer, the first line of your response must begin with "
+        "'I did not find exact information about ...' and briefly name the missing topic. After that first line, "
+        "you may give the most relevant related information from the inputs.\n"
         "Do NOT mention SQL, databases, RAG, retrieval, or any internal tools. Just speak as a helpful information bot.\n"
         "Never invent data or trends not present in the inputs."
         + ("\n\nYou are in a conversation. Reference previous questions naturally when it helps the user." if conversation_history else "")
@@ -733,6 +1058,7 @@ def _run_hybrid(question: str, plan: Dict[str, Any], conversation_history: Optio
     except Exception:
         answer = (sql_part.get("answer") or "") + "\n\n" + (rag_part.get("answer") or "")
 
+    answer = _apply_default_fallback_if_needed(question, answer)
     return {"answer": answer, "sql": sql_part, "rag": rag_part}
 
 
@@ -791,5 +1117,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

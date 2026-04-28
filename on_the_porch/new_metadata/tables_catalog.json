@@ -5,9 +5,14 @@
     "metadata_file": "crime_incident_reports.json"
   },
   {
-    "table": "bos311_data",
+    "table": "service_requests_311",
     "description": "Citywide 311 service requests from Boston Open Data Portal (NEW SYSTEM); one row per request with lifecycle fields, request type, status, and location context. Fields mapped from new API: open_date->open_dt, case_topic->type.",
-    "metadata_file": "bos311_data.json"
+    "metadata_file": "service_requests_311.json"
+  },
+  {
+    "table": "admin_knowledge",
+    "description": "Community notes and admin knowledge entries added by moderators; one row per note with content, category, active status, source flag, and timestamps.",
+    "metadata_file": "admin_knowledge.json"
   },
   {
     "table": "weekly_events",

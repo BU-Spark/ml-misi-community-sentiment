@@ -47,8 +47,13 @@ SQL_MAX_RETRIES = int(os.getenv("SQL_MAX_RETRIES", "2"))  # Reduced default to 2
 try:
     from langsmith import traceable  # type: ignore
 except Exception:
-    def traceable(func: Callable):  # type: ignore
-        return func
+    def traceable(*args, **kwargs):  # type: ignore
+        # Supports both @traceable and @traceable(name="foo") styles
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return args[0]
+        def decorator(func):
+            return func
+        return decorator
 
 
 def _langsmith_enabled() -> bool:
@@ -210,6 +215,67 @@ def _get_unique_values(table_name: str, column_name: str, schema: str = "public"
         conn.close()
 
 
+def _fetch_active_admin_knowledge(limit: int = 10) -> List[Dict[str, Any]]:
+    """Fetch recent active admin/community notes for answer-time context."""
+    conn = _get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT `id`, `content`, `category`, `created_at`
+                FROM `admin_knowledge`
+                WHERE `active` = TRUE
+                  AND `content` IS NOT NULL
+                  AND TRIM(`content`) <> ''
+                ORDER BY `created_at` DESC, `id` DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+            print([
+                {
+                    "id": row[0],
+                    "content": row[1],
+                    "category": row[2],
+                    "created_at": row[3],
+                }
+                for row in rows
+            ])
+            return [
+                {
+                    "id": row[0],
+                    "content": row[1],
+                    "category": row[2],
+                    "created_at": row[3],
+                }
+                for row in rows
+            ]
+    except Exception as exc:
+        print(f"[Warning] Could not fetch admin knowledge: {exc}", file=sys.stderr)
+        return []
+    finally:
+        conn.close()
+
+
+def _format_admin_knowledge_context(notes: List[Dict[str, Any]], max_notes: int = 8) -> str:
+    """Format admin/community notes for prompt context."""
+    if not notes:
+        return "(No active community notes available)"
+
+    lines: List[str] = []
+    for note in notes[:max_notes]:
+        note_id = note.get("id", "")
+        category = note.get("category", "general")
+        created_at = note.get("created_at", "")
+        content = str(note.get("content", "")).strip()
+        lines.append(
+            f"- Note #{note_id} | category: {category} | created_at: {created_at}\n"
+            f"  Content: {content}"
+        )
+    return "\n".join(lines)
+
+
 def _get_table_columns_from_sql(sql: str, schema_snapshot: str) -> Dict[str, List[str]]:
     """Extract table and column names from SQL query to identify which columns to get unique values from."""
     import re
@@ -304,7 +370,7 @@ def _ensure_dorchester_filter(sql: str, schema: str) -> str:
         else:
             # Can't determine filter, return as-is
             return sql
-    
+
     # Inject the filter into WHERE clause
     where_match = re.search(r'\bWHERE\b', sql, re.IGNORECASE)
     if where_match:
@@ -327,7 +393,7 @@ def _ensure_dorchester_filter(sql: str, schema: str) -> str:
         else:
             # No WHERE, ORDER BY, or LIMIT - add WHERE at the end
             sql = sql.rstrip().rstrip(';') + " WHERE " + dorchester_filter
-    
+
     return sql
 
 
@@ -487,8 +553,13 @@ def _llm_generate_sql(question: str, schema: str, default_model: str, metadata: 
         "NEVER return data from other neighborhoods or districts. If the question mentions another place, interpret it as \"in Dorchester\" and still filter to Dorchester only.\n"
         "- EXCEPTION: When querying the `weekly_events` table, DO NOT filter by Dorchester or any neighborhood; these events are general and should be returned regardless of location.\n"
         "- CRITICAL for `weekly_events` table: For date comparisons (e.g., 'this weekend', 'next week', date ranges), ALWAYS use `start_date` or `end_date` (DATE fields), NEVER use `event_date` (which is VARCHAR text like 'Monday' or 'June 3-5'). Use `event_date` only for display, not for filtering by date.\n"
+        "- If the question asks about a specific named item such as a named event, generate SQL that prefers exact or very close text matching on that item's name instead of broad related matches. This helps the downstream answer correctly say 'I did not find exact information about ...' when no exact match exists.\n"
         "- ALWAYS wrap table and column identifiers in backticks (`like_this`).\n"
         "- When using table aliases, always write them as separate backticked identifiers (for example, `T1`.`longitude`), never as a single backticked 'T1.longitude'."
+        "- LOCATION OUTPUT RULE: For 311/911 location questions, prefer street-level fields over area labels.\n"
+        "- For `service_requests_311`, include `street_number` and `street_name` in SELECT, and use them in GROUP BY/ORDER BY for location summaries.\n"
+        "- For `crime_incident_reports`, include `street` in SELECT, and use it in GROUP BY/ORDER BY for location summaries.\n"
+        "- Do NOT use `neighborhood`, `district`, zip, or area labels as the primary location output unless street fields are missing.\n"
     )
 
     if metadata:
@@ -525,8 +596,10 @@ def _llm_generate_sql(question: str, schema: str, default_model: str, metadata: 
     try:
         content = _call_gemini_with_logging(default_model, full_prompt, temperature=0)
         sql = _extract_sql_from_text(content)
+        print("\n[Generated SQL Before Dorchester Filter]\n" + sql + "\n")
         # Post-process to ensure Dorchester filter is present
         sql = _ensure_dorchester_filter(sql, schema)
+        print("\n[Generated SQL After Dorchester Filter]\n" + sql + "\n")
         return sql
     except Exception as exc:
         raise RuntimeError(f"Gemini error: {exc}")
@@ -587,6 +660,12 @@ def _llm_refine_sql(
         "- CRITICAL for `weekly_events` table: For date comparisons, ALWAYS use `start_date` or `end_date` (DATE fields), NEVER use `event_date` (VARCHAR). Use `event_date` only for display.\n"
         "- ALWAYS wrap table and column identifiers in backticks.\n"
         "- When using table aliases, always write them as separate backticked identifiers (for example, `T1`.`longitude`), never as a single backticked 'T1.longitude'."
+        "- LOCATION OUTPUT RULE: For 311/911 location questions, prefer street-level fields over area labels.\n"
+        "- For `service_requests_311`, include `street_number` and `street_name` in SELECT, and use them in GROUP BY/ORDER BY for location summaries.\n"
+        "- For `crime_incident_reports`, include `street` in SELECT, and use it in GROUP BY/ORDER BY for location summaries.\n"
+        "- Do NOT use `neighborhood`, `district`, zip, or area labels as the primary location output unless street fields are missing.\n"
+        "When reporting locations, name streets first (e.g., 'Blue Hill Ave', 'Talbot Ave & Washington St'). "
+        "Do not present district/neighborhood/zip as the main location unless no street data exists.\n"
     )
     
     # Build enhanced error analysis
@@ -607,8 +686,10 @@ def _llm_refine_sql(
     prompt = f"{system_prompt}\n\n{user_prompt}"
     content = _call_gemini_with_logging(default_model, prompt, temperature=0)
     sql = _extract_sql_from_text(content)
+    print("\n[Refined SQL Before Dorchester Filter]\n" + sql + "\n")
     # Post-process to ensure Dorchester filter is present
     sql = _ensure_dorchester_filter(sql, schema)
+    print("\n[Refined SQL After Dorchester Filter]\n" + sql + "\n")
     return sql
 
 
@@ -859,6 +940,9 @@ def _execute_with_retries(
 
 @traceable(name="summarize_answer")
 def _llm_generate_answer(question: str, sql: str, result: Dict[str, Any], default_model: str, conversation_history: List[Dict[str, str]] | None = None) -> str:
+    admin_notes = _fetch_active_admin_knowledge(limit=10)
+    admin_notes_context = _format_admin_knowledge_context(admin_notes)
+
     # If SQL failed, provide a graceful explanation instead of crashing
     error_text = result.get("error")
     if error_text:
@@ -871,10 +955,42 @@ def _llm_generate_answer(question: str, sql: str, result: Dict[str, Any], defaul
     cols = result.get("columns", [])
     rows = result.get("rows", [])
     if not rows:
+        if admin_notes:
+            system_prompt = (
+                "You are a friendly, non-technical assistant helping people understand Dorchester community information.\n"
+                "This system is configured for DORCHESTER ONLY.\n"
+                "Before answering, review the active community notes. "
+                "If they are relevant to the user's question, use them in your answer.\n"
+                "Do not mention SQL, databases, or internal tools.\n"
+                "If the community notes do not answer the question, the first line of your answer must begin with "
+                "'I did not find exact information about ...' and briefly name the missing topic. "
+                "After that first line, you may provide related information from the notes if it is genuinely helpful."
+                + ("\n\nYou are in a conversation. Reference previous questions naturally when it helps the user." if conversation_history else "")
+            )
+            user_prompt = (
+                "Question:\n" + question + "\n\n"
+                "Structured query returned no rows.\n\n"
+                "Active community notes:\n" + admin_notes_context + "\n\n"
+                "Please answer using the notes when relevant:"
+            )
+            full_prompt = system_prompt + "\n\n"
+            if conversation_history:
+                for msg in conversation_history[-10:]:
+                    role = msg.get("role", "")
+                    content = msg.get("content", "")
+                    full_prompt += f"{role.upper()}: {content}\n\n"
+            full_prompt += user_prompt
+            try:
+                content = _call_gemini_with_logging(default_model, full_prompt, temperature=0)
+                if content.strip():
+                    return content.strip()
+            except Exception:
+                pass
+
         unique_values = result.get("unique_values", {})
         if unique_values:
             # Build a helpful message with unique values
-            msg_parts = ["No results found matching your query."]
+            msg_parts = [f"I did not find exact information about {question.strip().rstrip('?.!') or 'that topic'}."]
             msg_parts.append("\n\nTo help refine your search, here are available values in key columns:")
             for col, vals in list(unique_values.items())[:3]:  # Limit to 3 columns
                 sample_vals = vals[:10]  # Show first 10 values
@@ -884,7 +1000,7 @@ def _llm_generate_answer(question: str, sql: str, result: Dict[str, Any], defaul
                 msg_parts.append(f"\n- **{col}**: {vals_str}")
             msg_parts.append("\n\nTry using one of these actual values from the database in your question.")
             return "".join(msg_parts)
-        return "No results found."
+        return f"I did not find exact information about {question.strip().rstrip('?.!') or 'that topic'}."
 
     max_rows = 30
     sample_rows = rows[:max_rows]
@@ -899,6 +1015,7 @@ def _llm_generate_answer(question: str, sql: str, result: Dict[str, Any], defaul
         "You are a friendly, non-technical assistant explaining results about Dorchester ONLY to a general audience.\n"
         "This system is configured to show ONLY Dorchester data. All queries are filtered to Dorchester only.\n"
         "Use clear, everyday language and speak as if you are talking directly to the user.\n"
+        "Before writing the answer, review the active community notes. If any note is relevant, incorporate it as supporting context.\n"
         "Focus on what the numbers mean for people in Dorchester (trends over time, comparisons within Dorchester, biggest/smallest values there), "
         "not on how the data was queried or any technical details.\n"
         "IMPORTANT: If you see any data from other neighborhoods in the results, ignore it completely and only discuss Dorchester data. "
@@ -913,6 +1030,7 @@ def _llm_generate_answer(question: str, sql: str, result: Dict[str, Any], defaul
 
     user_prompt = (
         "Question:\n" + question + "\n\n"
+        "Active community notes:\n" + admin_notes_context + "\n\n"
         "Executed SQL:\n" + sql + "\n\n"
         "Result (JSON, possibly truncated):\n" + json.dumps(data_blob, ensure_ascii=False, default=str)
     )
@@ -1143,6 +1261,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
