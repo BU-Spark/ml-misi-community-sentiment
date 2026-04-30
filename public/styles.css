@@ -1412,6 +1412,16 @@ body[data-events-collapsed='true'] .events-resizer {
   margin-top: 12px;
 }
 
+.message-text ul,
+.message-text ol {
+  padding-left: 1.6em;
+  margin: 14px 0;
+}
+
+.message-text li + li {
+  margin-top: 8px;
+}
+
 .message-meta {
   margin-top: 18px;
   align-items: center;
