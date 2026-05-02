@@ -572,6 +572,22 @@ textarea:focus-visible {
   margin-top: 10px;
 }
 
+/* Profile view button layout (Save Username + Log Out) */
+#profile-view .auth-form {
+  display: grid;
+  gap: 18px;
+}
+
+#profile-view .auth-submit {
+  margin-top: 0;
+}
+
+#profile-view #profile-logout {
+  width: 100%;
+  justify-content: center;
+  margin-top: 14px;
+}
+
 .auth-divider {
   display: flex;
   align-items: center;
