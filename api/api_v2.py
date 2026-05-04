@@ -187,6 +187,21 @@ DOC_TYPE_DIRS = {
 }
 
 
+def _log_exception(prefix: str, exc: Exception) -> None:
+    """
+    Log exceptions without leaking secrets (e.g., DB usernames/passwords).
+
+    We intentionally avoid printing the full exception string, since some
+    connector errors include connection context.
+    """
+    try:
+        errno = getattr(exc, "errno", None)
+        suffix = f" (errno={errno})" if errno is not None else ""
+        print(f"{prefix}: {exc.__class__.__name__}{suffix}", file=sys.stderr)
+    except Exception:
+        print(f"{prefix}: <error>", file=sys.stderr)
+
+
 db_pool = MySQLConnectionPool(
     host=Config.MYSQL_HOST,
     port=Config.MYSQL_PORT,
@@ -264,7 +279,7 @@ def ensure_interaction_log_columns():
         conn.commit()
         print("✓ interaction_log columns ready")
     except Exception as e:
-        print(f"Warning: Could not update interaction_log columns: {e}")
+        _log_exception("Warning: Could not update interaction_log columns", e)
     finally:
         if cursor:
             cursor.close()
@@ -293,7 +308,7 @@ def ensure_admin_knowledge_table():
         conn.commit()
         print("✓ admin_knowledge table ready")
     except Exception as e:
-        print(f"Warning: Could not create admin_knowledge table: {e}")
+        _log_exception("Warning: Could not create admin_knowledge table", e)
     finally:
         if cursor:
             cursor.close()
@@ -1256,7 +1271,7 @@ def log_interaction(
         conn.commit()
         return cursor.lastrowid
     except Exception as exc:
-        print(f"Error logging interaction: {exc}")
+        _log_exception("Error logging interaction", exc)
         return None
     finally:
         if cursor:
@@ -1407,7 +1422,7 @@ def before_request_handler():
         g.current_user = serialize_user(session_row, providers)
         g.session_id = session_row["session_id"]
     except Exception as exc:
-        print(f"Warning: session lookup failed: {exc}")
+        _log_exception("Warning: session lookup failed", exc)
     finally:
         if conn:
             conn.close()
@@ -1507,7 +1522,7 @@ def auth_signup():
     except Exception as exc:
         if conn:
             conn.rollback()
-        print(f"Error in signup: {exc}")
+        _log_exception("Error in signup", exc)
         return _json_error("Failed to create account.", 500, "signup_failed")
     finally:
         if conn:
@@ -1577,7 +1592,7 @@ def auth_login():
     except Exception as exc:
         if conn:
             conn.rollback()
-        print(f"Error in login: {exc}")
+        _log_exception("Error in login", exc)
         return _json_error("Failed to log in.", 500, "login_failed")
     finally:
         if conn:
@@ -1602,7 +1617,7 @@ def auth_logout():
     except Exception as exc:
         if conn:
             conn.rollback()
-        print(f"Error in logout: {exc}")
+        _log_exception("Error in logout", exc)
         return _json_error("Failed to log out.", 500, "logout_failed")
     finally:
         if conn:
@@ -1777,7 +1792,7 @@ def auth_complete_profile():
     except Exception as exc:
         if conn:
             conn.rollback()
-        print(f"Error completing profile: {exc}")
+        _log_exception("Error completing profile", exc)
         return _json_error("Failed to complete profile.", 500, "profile_update_failed")
     finally:
         if conn:
@@ -1817,7 +1832,7 @@ def auth_unlink_google():
     except Exception as exc:
         if conn:
             conn.rollback()
-        print(f"Error unlinking Google: {exc}")
+        _log_exception("Error unlinking Google", exc)
         return _json_error("Failed to unlink Google.", 500, "google_unlink_failed")
     finally:
         if conn:
@@ -1839,7 +1854,7 @@ def list_conversations():
         rows = _list_threads(conn, g.current_user_row["id"])
         return jsonify({"threads": [_serialize_thread(row) for row in rows]})
     except Exception as exc:
-        print(f"Error listing conversations: {exc}")
+        _log_exception("Error listing conversations", exc)
         return _json_error("Failed to load conversations.", 500, "conversation_list_failed")
     finally:
         if conn:
@@ -1867,7 +1882,7 @@ def create_conversation():
     except Exception as exc:
         if conn:
             conn.rollback()
-        print(f"Error creating conversation: {exc}")
+        _log_exception("Error creating conversation", exc)
         return _json_error("Failed to create conversation.", 500, "conversation_create_failed")
     finally:
         if conn:
@@ -1905,7 +1920,7 @@ def update_conversation(thread_id: str):
     except Exception as exc:
         if conn:
             conn.rollback()
-        print(f"Error updating conversation: {exc}")
+        _log_exception("Error updating conversation", exc)
         return _json_error("Failed to update conversation.", 500, "conversation_update_failed")
     finally:
         if conn:
@@ -1933,7 +1948,7 @@ def delete_conversation(thread_id: str):
     except Exception as exc:
         if conn:
             conn.rollback()
-        print(f"Error deleting conversation: {exc}")
+        _log_exception("Error deleting conversation", exc)
         return _json_error("Failed to delete conversation.", 500, "conversation_delete_failed")
     finally:
         if conn:
@@ -1961,7 +1976,7 @@ def get_conversation_messages(thread_id: str):
             "messages": [_serialize_message(row) for row in messages],
         })
     except Exception as exc:
-        print(f"Error fetching messages: {exc}")
+        _log_exception("Error fetching messages", exc)
         return _json_error("Failed to load messages.", 500, "conversation_messages_failed")
     finally:
         if conn:
@@ -2060,7 +2075,7 @@ def post_conversation_message(thread_id: str):
     except Exception as exc:
         if conn:
             conn.rollback()
-        print(f"Error posting conversation message: {exc}")
+        _log_exception("Error posting conversation message", exc)
         return _json_error("Failed to send message.", 500, "conversation_message_failed")
     finally:
         if conn:
@@ -2116,7 +2131,7 @@ def chat():
             }
         )
     except Exception as exc:
-        print(f"Error in /chat: {exc}")
+        _log_exception("Error in /chat", exc)
         return _json_error("Internal server error.", 500, "chat_failed")
 
 
@@ -2216,10 +2231,10 @@ def events():
     except mysql.connector.Error as exc:
         if getattr(exc, "errno", None) == 1146:
             return jsonify({"events": [], "total": 0})
-        print(f"Error in /events: {exc}")
+        _log_exception("Error in /events", exc)
         return _json_error("Failed to fetch events.", 500, "events_failed")
     except Exception as exc:
-        print(f"Error in /events: {exc}")
+        _log_exception("Error in /events", exc)
         return _json_error("Failed to fetch events.", 500, "events_failed")
     finally:
         if cursor:
