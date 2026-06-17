@@ -27,6 +27,8 @@ const ApiConfig = {
     window.APP_CONFIG?.chatTimeoutMs ?? window.APP_CONFIG?.CHAT_TIMEOUT_MS,
     null
   ),
+  // Opt-in: stream assistant replies token-by-token via Server-Sent Events.
+  streamingEnabled: Boolean(window.APP_CONFIG?.streaming ?? window.APP_CONFIG?.STREAMING ?? false),
 };
 
 function getCookie(name) {
@@ -39,6 +41,74 @@ function getCookie(name) {
     }
   }
   return '';
+}
+
+const GUEST_SESSION_KEY = 'otp_guest_session_token';
+const GUEST_CSRF_KEY = 'otp_guest_csrf_token';
+
+function getGuestSessionToken() {
+  try {
+    return sessionStorage.getItem(GUEST_SESSION_KEY) || '';
+  } catch (error) {
+    return '';
+  }
+}
+
+function getGuestCsrfToken() {
+  try {
+    return sessionStorage.getItem(GUEST_CSRF_KEY) || '';
+  } catch (error) {
+    return '';
+  }
+}
+
+function storeGuestSession({ session_token: sessionToken, csrf_token: csrfToken }) {
+  try {
+    if (sessionToken) {
+      sessionStorage.setItem(GUEST_SESSION_KEY, sessionToken);
+    }
+    if (csrfToken) {
+      sessionStorage.setItem(GUEST_CSRF_KEY, csrfToken);
+    }
+  } catch (error) {
+    // sessionStorage may be unavailable in restrictive contexts.
+  }
+}
+
+function clearGuestSession() {
+  try {
+    sessionStorage.removeItem(GUEST_SESSION_KEY);
+    sessionStorage.removeItem(GUEST_CSRF_KEY);
+  } catch (error) {
+    // ignore
+  }
+}
+
+function hasGuestSession() {
+  return Boolean(getGuestSessionToken());
+}
+
+function applyAuthHeaders(headers, method) {
+  const guestToken = getGuestSessionToken();
+  const isMutating = !['GET', 'HEAD', 'OPTIONS'].includes(method);
+
+  if (guestToken) {
+    headers.Authorization = `Bearer ${guestToken}`;
+    if (isMutating) {
+      const guestCsrf = getGuestCsrfToken();
+      if (guestCsrf) {
+        headers['X-CSRF-Token'] = guestCsrf;
+      }
+    }
+    return;
+  }
+
+  if (isMutating) {
+    const csrfToken = getCookie('otp_csrf');
+    if (csrfToken) {
+      headers['X-CSRF-Token'] = csrfToken;
+    }
+  }
 }
 
 async function apiRequest(path, options = {}) {
@@ -56,12 +126,7 @@ async function apiRequest(path, options = {}) {
     headers['Content-Type'] = 'application/json';
   }
 
-  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
-    const csrfToken = getCookie('otp_csrf');
-    if (csrfToken) {
-      headers['X-CSRF-Token'] = csrfToken;
-    }
-  }
+  applyAuthHeaders(headers, method);
 
   try {
     const response = await fetch(`${ApiConfig.baseUrl}${path}`, {
@@ -83,11 +148,19 @@ async function apiRequest(path, options = {}) {
     }
 
     if (!response.ok) {
+      let errorMessage = (payload && (payload.error || payload.message)) || `Request failed with status ${response.status}`;
+      if (response.status === 429) {
+        const retryAfter = payload?.retry_after;
+        errorMessage = retryAfter
+          ? `Too many requests. Please wait ${retryAfter} seconds and try again.`
+          : 'Too many requests. Please try again later.';
+      }
       return {
         success: false,
         status: response.status,
         data: payload,
-        error: (payload && (payload.error || payload.message)) || `Request failed with status ${response.status}`,
+        error: errorMessage,
+        retryAfter: payload?.retry_after ?? null,
       };
     }
 
@@ -114,22 +187,143 @@ async function apiRequest(path, options = {}) {
   }
 }
 
-function googleAuthUrl(intent = 'login', nextPath = '/') {
-  const params = new URLSearchParams({ intent, next: nextPath });
-  return `${ApiConfig.baseUrl}/auth/google/start?${params.toString()}`;
+async function sendMessageStream(threadId, payload, { onDelta, onCorrection, timeoutMs } = {}) {
+  const streamTimeout = timeoutMs === undefined
+    ? (ApiConfig.chatTimeoutMs ?? 120000)
+    : timeoutMs;
+  const headers = {
+    'Content-Type': 'application/json',
+    Accept: 'text/event-stream',
+  };
+  applyAuthHeaders(headers, 'POST');
+
+  const controller = new AbortController();
+  const shouldAbort = Number.isFinite(streamTimeout) && streamTimeout > 0;
+  const timeoutId = shouldAbort ? setTimeout(() => controller.abort(), streamTimeout) : null;
+
+  let response;
+  try {
+    response = await fetch(`${ApiConfig.baseUrl}/conversations/${threadId}/messages/stream`, {
+      method: 'POST',
+      credentials: 'include',
+      headers,
+      body: JSON.stringify(payload),
+      signal: shouldAbort ? controller.signal : undefined,
+    });
+  } catch (error) {
+    if (timeoutId) clearTimeout(timeoutId);
+    const timedOut = error?.name === 'AbortError';
+    return {
+      success: false,
+      status: null,
+      data: null,
+      error: timedOut
+        ? 'The response took too long. Please try again.'
+        : (error.message || 'Unable to reach the server.'),
+    };
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+
+  if (!response.ok || !response.body) {
+    let data = null;
+    try {
+      data = await response.json();
+    } catch (error) {
+      data = null;
+    }
+    let errorMessage = (data && (data.error || data.message)) || `Request failed with status ${response.status}`;
+    if (response.status === 429) {
+      const retryAfter = data?.retry_after;
+      errorMessage = retryAfter
+        ? `Too many requests. Please wait ${retryAfter} seconds and try again.`
+        : 'Too many requests. Please try again later.';
+    }
+    return {
+      success: false,
+      status: response.status,
+      data,
+      error: errorMessage,
+      retryAfter: data?.retry_after ?? null,
+    };
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let finalEvent = null;
+  let errorEvent = null;
+
+  const handleEvent = (rawEvent) => {
+    const dataLine = rawEvent.split('\n').find((line) => line.startsWith('data:'));
+    if (!dataLine) return;
+    const jsonStr = dataLine.slice(5).trim();
+    if (!jsonStr) return;
+    let evt;
+    try {
+      evt = JSON.parse(jsonStr);
+    } catch (error) {
+      return;
+    }
+    if (evt.type === 'delta') {
+      if (onDelta) onDelta(evt.text || '');
+    } else if (evt.type === 'correction') {
+      if (onCorrection) onCorrection(evt.text || '');
+    } else if (evt.type === 'final') {
+      finalEvent = evt;
+    } else if (evt.type === 'error') {
+      errorEvent = evt;
+    }
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buffer.indexOf('\n\n')) >= 0) {
+        const rawEvent = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        handleEvent(rawEvent);
+      }
+    }
+    if (buffer.trim()) {
+      handleEvent(buffer);
+    }
+  } catch (error) {
+    return { success: false, status: null, data: null, error: error.message || 'Stream interrupted.' };
+  }
+
+  if (errorEvent) {
+    return { success: false, status: 200, data: errorEvent, error: errorEvent.error || 'Generation failed.' };
+  }
+  if (finalEvent) {
+    return { success: true, status: 200, data: finalEvent, error: null };
+  }
+  return { success: false, status: 200, data: null, error: 'The response stream ended unexpectedly.' };
 }
 
 window.ApiClient = {
   config: ApiConfig,
   request: apiRequest,
+  hasGuestSession,
+  clearGuestSession,
+  storeGuestSession,
+  getGuestSessionToken,
   health: () => apiRequest('/health', { method: 'GET' }),
   getSession: () => apiRequest('/auth/me', { method: 'GET' }),
+  createGuestSession: async () => {
+    const result = await apiRequest('/auth/guest', { method: 'POST' });
+    if (result.success && result.data) {
+      storeGuestSession(result.data);
+    }
+    return result;
+  },
   signup: (payload) => apiRequest('/auth/signup', { method: 'POST', body: JSON.stringify(payload) }),
   login: (payload) => apiRequest('/auth/login', { method: 'POST', body: JSON.stringify(payload) }),
   logout: () => apiRequest('/auth/logout', { method: 'POST', body: JSON.stringify({}) }),
-  googleAuthUrl,
   completeProfile: (payload) => apiRequest('/auth/complete-profile', { method: 'POST', body: JSON.stringify(payload) }),
-  unlinkGoogle: () => apiRequest('/auth/unlink/google', { method: 'POST', body: JSON.stringify({}) }),
   fetchThreads: () => apiRequest('/conversations', { method: 'GET' }),
   createThread: (payload = {}) => apiRequest('/conversations', { method: 'POST', body: JSON.stringify(payload) }),
   updateThread: (threadId, payload) => apiRequest(`/conversations/${threadId}`, { method: 'PATCH', body: JSON.stringify(payload) }),
@@ -146,6 +340,7 @@ window.ApiClient = {
     body: JSON.stringify(payload),
     timeoutMs: ApiConfig.chatTimeoutMs,
   }),
+  sendMessageStream,
   fetchEvents: (daysAhead = 14, limit = 10) => {
     const qs = new URLSearchParams({ days_ahead: String(daysAhead), limit: String(limit) });
     return apiRequest(`/events?${qs.toString()}`, { method: 'GET' });

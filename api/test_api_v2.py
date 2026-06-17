@@ -166,6 +166,77 @@ def test_login(session: requests.Session, email: str, password: str) -> bool:
     return response.status_code == 200
 
 
+def test_guest_bootstrap() -> tuple[bool, str, str]:
+    print("\n=== Testing /auth/guest ===")
+    response = requests.post(f"{BASE_URL}/auth/guest", timeout=REQUEST_TIMEOUT)
+    print(f"Status: {response.status_code}")
+    data = response.json()
+    print(pretty({k: data.get(k) for k in ("user", "expires_at")}))
+    token = data.get("session_token", "")
+    csrf = data.get("csrf_token", "")
+    ok = (
+        response.status_code == 201
+        and bool(token)
+        and bool(csrf)
+        and data.get("user", {}).get("is_guest") is True
+    )
+    return ok, token, csrf
+
+
+def guest_headers(session_token: str, csrf_token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {session_token}",
+        "X-CSRF-Token": csrf_token,
+    }
+
+
+def test_guest_auth_me(session_token: str) -> bool:
+    print("\n=== Testing /auth/me with guest Bearer ===")
+    response = requests.get(
+        f"{BASE_URL}/auth/me",
+        headers={"Authorization": f"Bearer {session_token}"},
+        timeout=REQUEST_TIMEOUT,
+    )
+    print(f"Status: {response.status_code}")
+    data = response.json()
+    print(pretty(data))
+    return (
+        response.status_code == 200
+        and data.get("authenticated") is True
+        and data.get("is_guest") is True
+    )
+
+
+def test_guest_admin_blocked(session_token: str) -> bool:
+    print("\n=== Testing guest blocked from /admin/stats ===")
+    response = requests.get(
+        f"{BASE_URL}/admin/stats",
+        headers={"Authorization": f"Bearer {session_token}"},
+        timeout=REQUEST_TIMEOUT,
+    )
+    data = response.json()
+    print(pretty(data))
+    return (
+        response.status_code == 403
+        and data.get("code") == "guest_not_allowed"
+    )
+
+
+def test_guest_create_conversation(session_token: str, csrf_token: str) -> tuple[bool, str]:
+    print("\n=== Testing guest /conversations (POST) ===")
+    response = requests.post(
+        f"{BASE_URL}/conversations",
+        json={"title": "Guest smoke test"},
+        headers=guest_headers(session_token, csrf_token),
+        timeout=REQUEST_TIMEOUT,
+    )
+    print(f"Status: {response.status_code}")
+    data = response.json()
+    print(pretty(data))
+    thread_id = data.get("thread", {}).get("id", "")
+    return response.status_code == 201 and bool(thread_id), thread_id
+
+
 if __name__ == "__main__":
     print(f"Testing API v2 endpoints at {BASE_URL}...")
     results: list[tuple[str, bool]] = []
@@ -173,6 +244,14 @@ if __name__ == "__main__":
 
     results.append(("Health", test_health()))
     results.append(("Auth bootstrap", bootstrap_session(client)))
+
+    guest_ok, guest_token, guest_csrf = test_guest_bootstrap()
+    results.append(("Guest bootstrap", guest_ok))
+    if guest_ok:
+        results.append(("Guest /auth/me", test_guest_auth_me(guest_token)))
+        results.append(("Guest admin blocked", test_guest_admin_blocked(guest_token)))
+        guest_thread_ok, _guest_thread_id = test_guest_create_conversation(guest_token, guest_csrf)
+        results.append(("Guest create conversation", guest_thread_ok))
 
     signup_ok, email, password = test_signup(client)
     results.append(("Signup", signup_ok))

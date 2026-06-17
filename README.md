@@ -91,11 +91,17 @@ Once you’ve followed the steps in `demo/README.md`, you can **skip the Install
    - Or use the demo DB described in `demo/README.md`
    - For ingestion + live data sync, see `on_the_porch/data_ingestion/README.md`
 
-6. **Run the API**
+6. **Run the API** (development)
    ```bash
-   python api/api_v2.py
+   ./venv/bin/python api/api_v2.py
    ```
    The API will start on `http://127.0.0.1:8888`
+
+   For production, use gunicorn instead:
+   ```bash
+   ./start_redis.sh          # optional but recommended for multi-worker
+   ./start_api.sh
+   ```
 
 7. **Run the Frontend** (in a separate terminal)
    ```bash
@@ -120,10 +126,24 @@ The project uses a **single `.env` file at the repo root**.
 
 **Key Variables (non-exhaustive):**
 - `GEMINI_API_KEY` – Google Gemini API key (required)
-- `RETHINKAI_API_KEYS` – legacy API keys (used only by `POST /chat` and `GET /events`)
+- `FLASK_SECRET_KEY`, `TOKEN_PEPPER` – generate strong random values for production
+- `FLASK_SESSION_COOKIE_SECURE=true` – required when serving over HTTPS
+- `ALLOWED_ORIGINS` – comma-separated frontend origins for CORS
+- `CACHE_BACKEND=redis`, `REDIS_URL` – **required** when running multiple gunicorn workers
+- `GUNICORN_WORKERS`, `GUNICORN_THREADS`, `GUNICORN_TIMEOUT` – production server tuning
+- `RATE_LIMIT_*`, `GUEST_CLEANUP_ENABLED` – abuse protection and guest DB hygiene
 - `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DB` – MySQL connection
 - `VECTORDB_DIR` – path to the ChromaDB/vector DB directory
 - `GOOGLE_DRIVE_FOLDER_ID` and related `GOOGLE_*/GMAIL_*` settings – data ingestion
+
+**Frontend production config** (`public/config.js`):
+```javascript
+window.APP_CONFIG = {
+  apiBaseUrl: 'https://api.yourdomain.com',
+  streaming: true,
+  chatTimeoutMs: 120000,
+};
+```
 
 ## 📊 Data Sources
 
@@ -252,20 +272,35 @@ This project implements a **hybrid AI system** that combines:
 
 ## 🌐 Deployment
 
-### DreamHost Setup (needs to be tested)
+### Production checklist
 
-See `scripts/dreamhost/` for deployment scripts:
-- `setup.sh` - Initial server setup
-- `deploy.sh` - Application deployment
-- `database_setup.sh` - Database initialization
+1. Copy `example_env.txt` → `.env` and set strong `FLASK_SECRET_KEY` + `TOKEN_PEPPER`
+2. Set `FLASK_DEBUG=false` and `FLASK_SESSION_COOKIE_SECURE=true` behind HTTPS
+3. Configure `ALLOWED_ORIGINS` for your real frontend domain
+4. Run **Redis** and set `CACHE_BACKEND=redis` when using `GUNICORN_WORKERS > 1`
+5. Start API with `./start_api.sh` (gunicorn, not the Flask dev server)
+6. Serve `public/` via your web server or CDN; set `apiBaseUrl` in `public/config.js`
+7. Schedule `./cron_ingest.sh` for data sync; set `GUEST_CLEANUP_ENABLED=true`
+8. Verify `GET /health` reports `database`, `redis`, and `chroma` as healthy
 
-### Production Considerations
+### Local production-like stack
 
-- Use `gunicorn` or similar WSGI server for production
-- Set `FLASK_SESSION_COOKIE_SECURE=True` for HTTPS
-- Configure proper CORS origins
-- Set up database backups
-- Monitor API usage and costs
+```bash
+./start_redis.sh
+./start_api.sh
+cd public && python -m http.server 8000
+```
+
+### DreamHost / legacy scripts
+
+See `scripts/dreamhost/` for older deployment scripts. They may be out of date with the unified `.env` + MySQL + gunicorn model above.
+
+### Production considerations
+
+- Use gunicorn (`./start_api.sh`) — the Flask dev server is not suitable for production
+- Redis shares session cache and rate limits across gunicorn workers
+- Set up MySQL + ChromaDB backups
+- Monitor Gemini API usage and costs
 
 ## 📝 License
 

@@ -4,7 +4,7 @@ const state = {
   eventsPanelCollapsed: false,
   eventsPanelWidth: 340,
   user: null,
-  googleEnabled: false,
+  isGuest: false,
   threads: [],
   activeThreadId: null,
   messages: [],
@@ -14,6 +14,7 @@ const state = {
   currentFlagLogId: null,
   threadModalMode: null,
   threadModalThreadId: null,
+  authReturnToApp: false,
 };
 
 const elements = {
@@ -27,12 +28,12 @@ const elements = {
   profileForm: document.getElementById('profile-form'),
   tabLogin: document.getElementById('tab-login'),
   tabSignup: document.getElementById('tab-signup'),
-  googleAuthButton: document.getElementById('google-auth-button'),
+  guestContinueButton: document.getElementById('guest-continue-button'),
+  authBackToChat: document.getElementById('auth-back-to-chat'),
+  loginButton: document.getElementById('login-button'),
   profileLogout: document.getElementById('profile-logout'),
   accountUsername: document.getElementById('account-username'),
   accountEmail: document.getElementById('account-email'),
-  accountProviders: document.getElementById('account-providers'),
-  googleLinkToggle: document.getElementById('google-link-toggle'),
   adminLink: document.getElementById('admin-link'),
   logoutButton: document.getElementById('logout-button'),
   threadList: document.getElementById('thread-list'),
@@ -43,6 +44,7 @@ const elements = {
   themeToggle: document.getElementById('theme-toggle'),
   themeToggles: Array.from(document.querySelectorAll('[data-theme-toggle]')),
   eventsPanelToggle: document.getElementById('events-panel-toggle'),
+  eventsPanel: document.getElementById('events-panel'),
   eventsResizer: document.getElementById('events-resizer'),
   chatMessages: document.getElementById('chat-messages'),
   chatError: document.getElementById('chat-error'),
@@ -80,11 +82,6 @@ const sourceMapping = {
   homicide_data: { label: 'Crime data (homicides)', path: 'https://data.boston.gov/dataset/crime-incident-reports-august-2015-to-date-source-new-system' },
   weekly_events: { label: 'Community newsletters', path: null },
   crime_incident: { label: 'Crime data', path: 'https://data.boston.gov/dataset/crime-incident-reports-august-2015-to-date-source-new-system' },
-};
-
-const providerLabels = {
-  password: 'Email',
-  google: 'Google',
 };
 
 const THEME_STORAGE_KEY = 'otp-theme';
@@ -359,10 +356,21 @@ function showView(name) {
   elements.authView.hidden = name !== 'auth';
   elements.profileView.hidden = name !== 'profile';
   elements.appView.hidden = name !== 'app';
+  updateAuthChrome();
 }
 
-function resetAppState() {
+function updateAuthChrome() {
+  if (elements.loginButton) {
+    elements.loginButton.hidden = !state.isGuest || elements.appView.hidden;
+  }
+  if (elements.authBackToChat) {
+    elements.authBackToChat.hidden = !state.authReturnToApp || elements.authView.hidden;
+  }
+}
+
+function resetAppState({ clearGuestSession = false } = {}) {
   state.user = null;
+  state.isGuest = false;
   state.threads = [];
   state.activeThreadId = null;
   state.messages = [];
@@ -375,18 +383,41 @@ function resetAppState() {
   renderThreads();
   updateThreadHeader();
   renderMessages();
+  if (clearGuestSession) {
+    ApiClient.clearGuestSession();
+  }
+}
+
+function applySessionUser(sessionPayload) {
+  state.user = sessionPayload.user || null;
+  state.isGuest = Boolean(
+    sessionPayload.is_guest ?? sessionPayload.user?.is_guest,
+  );
+  if (state.user && !state.isGuest) {
+    ApiClient.clearGuestSession();
+  }
 }
 
 function forceSignedOut(message = 'Your session expired. Sign in again.') {
-  resetAppState();
+  state.authReturnToApp = false;
+  resetAppState({ clearGuestSession: true });
   setError(elements.authError, message);
   setError(elements.profileError, '');
   setError(elements.chatError, '');
   showView('auth');
 }
 
-function handleAuthFailure(result, message) {
+async function handleAuthFailure(result, message) {
   if (result && result.status === 401) {
+    if (state.isGuest || ApiClient.hasGuestSession()) {
+      ApiClient.clearGuestSession();
+      state.isGuest = false;
+      const restored = await ensureSession();
+      if (restored) {
+        showToast('Started a fresh guest session.', 'default');
+      }
+      return true;
+    }
     forceSignedOut(message);
     return true;
   }
@@ -460,24 +491,20 @@ function setAuthMode(mode) {
 
 function renderUser() {
   if (!state.user) return;
-  elements.accountUsername.textContent = state.user.username || 'Pending profile';
-  elements.accountEmail.textContent = state.user.email || '—';
-  elements.accountProviders.innerHTML = '';
-  (state.user.linked_providers || []).forEach((provider) => {
-    const pill = document.createElement('span');
-    pill.className = 'provider-pill';
-    pill.textContent = providerLabels[provider] || provider;
-    elements.accountProviders.appendChild(pill);
-  });
 
-  const hasGoogle = Boolean(state.user.has_google);
-  elements.googleLinkToggle.textContent = hasGoogle ? 'Unlink Google' : 'Link Google';
-  elements.googleLinkToggle.dataset.mode = hasGoogle ? 'unlink' : 'link';
-  elements.googleLinkToggle.disabled = false;
-  elements.googleLinkToggle.title = !state.googleEnabled && !hasGoogle
-    ? 'Google OAuth is not configured on this server.'
-    : '';
-  elements.adminLink.classList.toggle('hidden', state.user.role !== 'admin');
+  if (state.isGuest) {
+    elements.accountUsername.textContent = 'Guest';
+    elements.accountEmail.textContent = 'Temporary session';
+    elements.logoutButton.textContent = 'Sign in';
+    elements.adminLink.classList.add('hidden');
+  } else {
+    elements.accountUsername.textContent = state.user.username || 'Pending profile';
+    elements.accountEmail.textContent = state.user.email || '—';
+    elements.logoutButton.textContent = 'Log Out';
+    elements.adminLink.classList.toggle('hidden', state.user.role !== 'admin');
+  }
+
+  updateAuthChrome();
 }
 
 function renderThreads() {
@@ -485,9 +512,12 @@ function renderThreads() {
   if (!state.threads.length) {
     const empty = document.createElement('div');
     empty.className = 'thread-empty';
+    const guestNote = state.isGuest
+      ? 'Guest chats are temporary and last only for this browser tab.'
+      : 'Start a thread to keep follow-ups and flagged responses tied to your account.';
     empty.innerHTML = `
       <strong>No saved conversations</strong>
-      <span>Start a thread to keep follow-ups and flagged responses tied to your account.</span>
+      <span>${guestNote}</span>
     `;
     elements.threadList.appendChild(empty);
     return;
@@ -914,52 +944,60 @@ function normalizeMessages(messages) {
   return ordered.map(({ __index, ...message }) => message);
 }
 
-function parseAuthErrorCode(code) {
-  const map = {
-    google_oauth_disabled: 'Google sign-in is not configured on this server yet.',
-    google_oauth_failed: 'Google sign-in failed. Try again.',
-    google_email_not_verified: 'Google returned an unverified email address.',
-    existing_account_requires_password_login: 'This email already has an account. Sign in with your password, then link Google from inside the app.',
-    google_email_mismatch: 'The Google account email did not match your existing account email.',
-    google_account_already_linked: 'That Google account is already linked to another user.',
-    login_required_for_link: 'Sign in before linking Google.',
-    oauth_link_session_mismatch: 'Your linking session expired. Start the link flow again.',
-  };
-  return map[code] || '';
-}
-
 async function refreshSession() {
   const result = await ApiClient.getSession();
   if (!result.success) {
-    resetAppState();
-    setError(elements.authError, result.error);
-    showView('auth');
-    return false;
+    return ensureSession();
   }
 
-  state.user = result.data.user || null;
-  state.googleEnabled = Boolean(result.data.google_oauth_enabled);
-  elements.googleAuthButton.title = !state.googleEnabled
-    ? 'Google OAuth is not configured on this server.'
-    : '';
-
-  const oauthError = new URLSearchParams(window.location.search).get('auth_error');
-  if (oauthError) {
-    window.history.replaceState({}, document.title, window.location.pathname);
-    setError(elements.authError, parseAuthErrorCode(oauthError));
+  if (!result.data.user) {
+    return ensureSession();
   }
 
-  if (!state.user) {
-    resetAppState();
-    showView('auth');
-    return false;
-  }
+  applySessionUser(result.data);
 
   if (!state.user.profile_complete) {
     renderUser();
     showView('profile');
     return true;
   }
+
+  showView('app');
+  renderUser();
+  await ensureInitialData();
+  return true;
+}
+
+async function ensureSession() {
+  setError(elements.chatError, '');
+
+  const result = await ApiClient.getSession();
+  if (result.success && result.data.user) {
+    applySessionUser(result.data);
+
+    if (!state.user.profile_complete) {
+      renderUser();
+      showView('profile');
+      return true;
+    }
+
+    showView('app');
+    renderUser();
+    await ensureInitialData();
+    return true;
+  }
+
+  const guest = await ApiClient.createGuestSession();
+  if (!guest.success || !guest.data?.user) {
+    setError(elements.chatError, guest.error || 'Could not start a guest session.');
+    showView('app');
+    return false;
+  }
+
+  applySessionUser({
+    user: guest.data.user,
+    is_guest: true,
+  });
 
   showView('app');
   renderUser();
@@ -974,20 +1012,19 @@ async function ensureInitialData() {
 async function loadThreads(selectThreadId = null) {
   const result = await ApiClient.fetchThreads();
   if (!result.success) {
-    if (handleAuthFailure(result)) return;
+    if (await handleAuthFailure(result)) return;
     setError(elements.chatError, result.error);
     return;
   }
 
   state.threads = result.data.threads || [];
   if (!state.threads.length) {
-    const created = await ApiClient.createThread({});
-    if (!created.success) {
-      if (handleAuthFailure(created)) return;
-      setError(elements.chatError, created.error);
-      return;
-    }
-    state.threads = [created.data.thread];
+    state.activeThreadId = null;
+    state.messages = [];
+    renderThreads();
+    updateThreadHeader();
+    renderMessages();
+    return;
   }
 
   const nextId = selectThreadId && state.threads.some((thread) => thread.id === selectThreadId)
@@ -1006,7 +1043,7 @@ async function loadMessages(threadId) {
   const requestVersion = ++state.messageVersion;
   const result = await ApiClient.fetchMessages(threadId, { limit: 50 });
   if (!result.success) {
-    if (handleAuthFailure(result)) return;
+    if (await handleAuthFailure(result)) return;
     if (result.status === 409 && result.data && result.data.code === 'profile_incomplete') {
       showView('profile');
       return;
@@ -1033,12 +1070,31 @@ async function loadMessages(threadId) {
   renderMessages();
 }
 
+async function ensureActiveThread() {
+  if (state.activeThreadId) {
+    return true;
+  }
+  const result = await ApiClient.createThread({});
+  if (!result.success) {
+    if (await handleAuthFailure(result)) return false;
+    setError(elements.chatError, result.error);
+    return false;
+  }
+  state.threads.unshift(result.data.thread);
+  state.activeThreadId = result.data.thread.id;
+  state.messages = [];
+  renderThreads();
+  updateThreadHeader();
+  renderMessages();
+  return true;
+}
+
 async function createThread() {
   setError(elements.chatError, '');
   state.messageVersion += 1;
   const result = await ApiClient.createThread({});
   if (!result.success) {
-    if (handleAuthFailure(result)) return;
+    if (await handleAuthFailure(result)) return;
     setError(elements.chatError, result.error);
     return;
   }
@@ -1084,7 +1140,7 @@ async function submitRenameThread() {
   }
   const result = await ApiClient.updateThread(thread.id, { title: trimmed });
   if (!result.success) {
-    if (handleAuthFailure(result)) return;
+    if (await handleAuthFailure(result)) return;
     setError(elements.threadModalError, result.error);
     return;
   }
@@ -1121,7 +1177,7 @@ async function submitDeleteThread() {
   }
   const result = await ApiClient.deleteThread(thread.id);
   if (!result.success) {
-    if (handleAuthFailure(result)) return;
+    if (await handleAuthFailure(result)) return;
     setError(elements.threadModalError, result.error);
     return;
   }
@@ -1133,7 +1189,11 @@ async function submitDeleteThread() {
   updateThreadHeader();
   renderMessages();
   if (!state.threads.length) {
-    await createThread();
+    state.activeThreadId = null;
+    state.messages = [];
+    renderThreads();
+    updateThreadHeader();
+    renderMessages();
   } else {
     await loadMessages(state.threads[0].id);
   }
@@ -1143,9 +1203,15 @@ async function submitDeleteThread() {
 
 async function sendChatMessage(event) {
   event.preventDefault();
-  if (state.isSendingMessage || !state.activeThreadId) return;
+  if (state.isSendingMessage) return;
   const message = elements.chatInput.value.trim();
   if (!message) return;
+
+  if (!state.activeThreadId) {
+    const ready = await ensureActiveThread();
+    if (!ready) return;
+  }
+
   const threadId = state.activeThreadId;
   const requestVersion = ++state.messageVersion;
   const optimisticMessageId = `pending-user-${Date.now()}-${requestVersion}`;
@@ -1165,14 +1231,182 @@ async function sendChatMessage(event) {
   ];
   renderMessages();
   setChatLoading(true);
-  renderTypingIndicator();
+
+  const instant = window.InstantReplies?.isInstant(message);
+  const assistantPendingId = `pending-assistant-${Date.now()}-${requestVersion}`;
+
+  if (instant) {
+    const localReply = window.InstantReplies.reply(message);
+    state.messages = [
+      ...state.messages,
+      {
+        id: assistantPendingId,
+        role: 'assistant',
+        content: localReply,
+        created_at: new Date().toISOString(),
+        sources: [],
+      },
+    ];
+    renderMessages();
+  } else {
+    renderTypingIndicator();
+  }
 
   try {
+    if (instant) {
+      const result = await ApiClient.sendMessage(threadId, { message });
+      removeTypingIndicator();
+
+      if (!result.success) {
+        if (await handleAuthFailure(result)) return;
+        if (result.status === 429) {
+          showToast(result.error, 'warning');
+        }
+        if (result.status === 409 && result.data && result.data.code === 'profile_incomplete') {
+          showView('profile');
+          return;
+        }
+        state.messages = state.messages.filter(
+          (entry) => entry.id !== optimisticMessageId && entry.id !== assistantPendingId,
+        );
+        renderMessages();
+        if (!elements.chatInput.value) {
+          elements.chatInput.value = message;
+        }
+        setError(elements.chatError, result.error);
+        return;
+      }
+
+      const threadIndex = state.threads.findIndex((entry) => entry.id === result.data.thread.id);
+      if (threadIndex >= 0) {
+        state.threads[threadIndex] = result.data.thread;
+      }
+
+      if (requestVersion !== state.messageVersion || threadId !== state.activeThreadId) {
+        renderThreads();
+        updateThreadHeader();
+        return;
+      }
+
+      state.messages = normalizeMessages([
+        ...state.messages.filter(
+          (entry) => entry.id !== optimisticMessageId && entry.id !== assistantPendingId,
+        ),
+        result.data.user_message,
+        result.data.assistant_message,
+      ]);
+
+      renderThreads();
+      updateThreadHeader();
+      renderMessages();
+      return;
+    }
+
+    if (ApiClient.config.streamingEnabled) {
+      const assistantPendingIdStream = `pending-assistant-${Date.now()}-${requestVersion}`;
+      let assistantContent = '';
+      let streamTextEl = null;
+      let rafPending = false;
+
+      const isStale = () => requestVersion !== state.messageVersion || threadId !== state.activeThreadId;
+
+      // Update only the streaming bubble's text node, batched to one paint per
+      // animation frame. This avoids rebuilding the whole message list on every
+      // token (which caused the line-by-line flicker).
+      const flush = () => {
+        rafPending = false;
+        if (!streamTextEl) return;
+        streamTextEl.innerHTML = formatRichText(assistantContent);
+        elements.chatMessages.scrollTop = elements.chatMessages.scrollHeight;
+      };
+      const scheduleFlush = () => {
+        if (rafPending) return;
+        rafPending = true;
+        window.requestAnimationFrame(flush);
+      };
+
+      // Keep the "Thinking…" indicator visible until the first token arrives,
+      // then swap it for a real bubble we mutate in place.
+      const ensureAssistantBubble = () => {
+        if (streamTextEl) return;
+        removeTypingIndicator();
+        const element = createMessageElement({
+          id: assistantPendingIdStream,
+          role: 'assistant',
+          content: '',
+          created_at: new Date().toISOString(),
+          sources: [],
+        });
+        element.dataset.streaming = 'true';
+        elements.chatMessages.appendChild(element);
+        streamTextEl = element.querySelector('.message-text');
+        elements.chatMessages.scrollTop = elements.chatMessages.scrollHeight;
+      };
+
+      const streamResult = await ApiClient.sendMessageStream(threadId, { message }, {
+        onDelta: (text) => {
+          if (isStale() || !text) return;
+          ensureAssistantBubble();
+          assistantContent += text;
+          scheduleFlush();
+        },
+        onCorrection: (text) => {
+          if (isStale()) return;
+          ensureAssistantBubble();
+          assistantContent = text;
+          scheduleFlush();
+        },
+      });
+
+      removeTypingIndicator();
+
+      if (!streamResult.success) {
+        if (await handleAuthFailure(streamResult)) return;
+        if (streamResult.status === 429) {
+          showToast(streamResult.error, 'warning');
+        }
+        // The streaming bubble lives only in the DOM; re-rendering from state
+        // (which never held it) removes it cleanly.
+        state.messages = state.messages.filter((item) => item.id !== optimisticMessageId);
+        renderMessages();
+        if (!elements.chatInput.value) {
+          elements.chatInput.value = message;
+        }
+        setError(elements.chatError, streamResult.error);
+        return;
+      }
+
+      const data = streamResult.data;
+      const streamThreadIndex = state.threads.findIndex((entry) => entry.id === data.thread.id);
+      if (streamThreadIndex >= 0) {
+        state.threads[streamThreadIndex] = data.thread;
+      }
+      if (isStale()) {
+        renderThreads();
+        updateThreadHeader();
+        return;
+      }
+      // Replace the optimistic user bubble + transient streaming bubble with the
+      // authoritative server messages in one final render.
+      state.messages = normalizeMessages([
+        ...state.messages.filter((item) => item.id !== optimisticMessageId),
+        data.user_message,
+        data.assistant_message,
+      ]);
+      renderThreads();
+      updateThreadHeader();
+      renderMessages();
+      return;
+    }
+
     const result = await ApiClient.sendMessage(threadId, { message });
     removeTypingIndicator();
 
     if (!result.success) {
-      if (handleAuthFailure(result)) return;
+      if (await handleAuthFailure(result)) return;
+      if (result.status === 429) {
+        showToast(result.error, 'warning');
+      }
       if (result.status === 409 && result.data && result.data.code === 'profile_incomplete') {
         showView('profile');
         return;
@@ -1223,7 +1457,7 @@ async function loadEvents() {
   setEventsLoading(false);
 
   if (!result.success) {
-    if (handleAuthFailure(result)) return;
+    if (await handleAuthFailure(result)) return;
     setError(elements.eventsError, result.error);
     return;
   }
@@ -1298,23 +1532,86 @@ async function submitFlag() {
   showToast('Report submitted for review.', 'warning');
 }
 
+async function openAuthView() {
+  state.authReturnToApp = state.isGuest;
+  setError(elements.authError, '');
+  await ApiClient.getSession();
+  setAuthMode('login');
+  showView('auth');
+}
+
+async function handleBackToChat() {
+  state.authReturnToApp = false;
+  await handleContinueAsGuest();
+}
+
+async function handleContinueAsGuest() {
+  setError(elements.authError, '');
+  state.authReturnToApp = false;
+
+  if (ApiClient.hasGuestSession()) {
+    const result = await ApiClient.getSession();
+    if (result.success && result.data.user?.is_guest) {
+      applySessionUser(result.data);
+      showView('app');
+      renderUser();
+      await ensureInitialData();
+      return;
+    }
+    ApiClient.clearGuestSession();
+  }
+
+  const guest = await ApiClient.createGuestSession();
+  if (!guest.success || !guest.data?.user) {
+    setError(elements.authError, guest.error || 'Could not start a guest session.');
+    return;
+  }
+
+  applySessionUser({
+    user: guest.data.user,
+    is_guest: true,
+  });
+  resetAppState();
+  showView('app');
+  renderUser();
+  await ensureInitialData();
+}
+
+async function handleAccountAction() {
+  if (state.isGuest) {
+    await openAuthView();
+    return;
+  }
+  await handleLogout();
+}
+
 async function handleLogin(event) {
   event.preventDefault();
   setError(elements.authError, '');
+  const guestSessionToken = ApiClient.getGuestSessionToken();
+  ApiClient.clearGuestSession();
+  await ApiClient.getSession();
+
   const result = await ApiClient.login({
     email: document.getElementById('login-email').value,
     password: document.getElementById('login-password').value,
+    ...(guestSessionToken ? { guest_session_token: guestSessionToken } : {}),
   });
   if (!result.success) {
     setError(elements.authError, result.error);
     return;
   }
+  resetAppState();
+  state.authReturnToApp = false;
   await refreshSession();
 }
 
 async function handleSignup(event) {
   event.preventDefault();
   setError(elements.authError, '');
+  ApiClient.clearGuestSession();
+  await ApiClient.getSession();
+
   const result = await ApiClient.signup({
     username: document.getElementById('signup-username').value,
     email: document.getElementById('signup-email').value,
@@ -1324,6 +1621,8 @@ async function handleSignup(event) {
     setError(elements.authError, result.error);
     return;
   }
+  resetAppState();
+  state.authReturnToApp = false;
   await refreshSession();
 }
 
@@ -1341,47 +1640,20 @@ async function handleProfileSubmit(event) {
 }
 
 async function handleLogout() {
+  if (state.isGuest) {
+    ApiClient.clearGuestSession();
+    resetAppState();
+    await ensureSession();
+    return;
+  }
+
   await ApiClient.logout();
+  ApiClient.clearGuestSession();
   resetAppState();
   setError(elements.authError, '');
   setError(elements.profileError, '');
   setError(elements.chatError, '');
-  showView('auth');
-}
-
-async function handleGoogleLinkToggle() {
-  if (elements.googleLinkToggle.dataset.mode === 'unlink') {
-    state.threadModalMode = 'unlink-google';
-    state.threadModalThreadId = null;
-    elements.threadModalTitle.textContent = 'Unlink Google';
-    elements.threadModalCopy.textContent = 'Remove Google sign-in from this account. Your password login will remain available.';
-    elements.threadModalField.hidden = true;
-    elements.threadModalInput.value = '';
-    elements.threadModalConfirm.textContent = 'Unlink';
-    elements.threadModalConfirm.classList.add('danger-solid');
-    setError(elements.threadModalError, '');
-    elements.threadModal.hidden = false;
-    window.setTimeout(() => elements.threadModalConfirm.focus(), 0);
-    return;
-  }
-  if (!state.googleEnabled) {
-    setError(elements.chatError, 'Google sign-in is not configured on this server yet.');
-    return;
-  }
-  window.location.href = ApiClient.googleAuthUrl('link', '/');
-}
-
-async function submitUnlinkGoogle() {
-  const result = await ApiClient.unlinkGoogle();
-  if (!result.success) {
-    if (handleAuthFailure(result)) return;
-    setError(elements.threadModalError, result.error);
-    return;
-  }
-  state.user = result.data.user;
-  renderUser();
-  closeThreadModal();
-  showToast('Google sign-in removed from this account.', 'warning');
+  await ensureSession();
 }
 
 function handleModalBackdropClick(event) {
@@ -1433,17 +1705,12 @@ function initEventListeners() {
   elements.tabSignup.addEventListener('click', () => setAuthMode('signup'));
   elements.loginForm.addEventListener('submit', handleLogin);
   elements.signupForm.addEventListener('submit', handleSignup);
-  elements.googleAuthButton.addEventListener('click', () => {
-    if (!state.googleEnabled) {
-      setError(elements.authError, 'Google sign-in is not configured on this server.');
-      return;
-    }
-    window.location.href = ApiClient.googleAuthUrl('login', '/');
-  });
+  elements.guestContinueButton.addEventListener('click', handleContinueAsGuest);
+  elements.authBackToChat.addEventListener('click', handleBackToChat);
+  elements.loginButton.addEventListener('click', openAuthView);
   elements.profileForm.addEventListener('submit', handleProfileSubmit);
-  elements.profileLogout.addEventListener('click', handleLogout);
-  elements.logoutButton.addEventListener('click', handleLogout);
-  elements.googleLinkToggle.addEventListener('click', handleGoogleLinkToggle);
+  elements.profileLogout.addEventListener('click', handleAccountAction);
+  elements.logoutButton.addEventListener('click', handleAccountAction);
   elements.newThreadButton.addEventListener('click', createThread);
   elements.renameThreadButton.addEventListener('click', () => renameThread());
   elements.deleteThreadButton.addEventListener('click', () => deleteThread());
@@ -1465,10 +1732,6 @@ function initEventListeners() {
   elements.threadModal.addEventListener('click', handleModalBackdropClick);
   elements.threadModalCancel.addEventListener('click', closeThreadModal);
   elements.threadModalConfirm.addEventListener('click', async () => {
-    if (state.threadModalMode === 'unlink-google') {
-      await submitUnlinkGoogle();
-      return;
-    }
     await submitThreadModal();
   });
   document.addEventListener('keydown', handleGlobalKeydown);
@@ -1490,7 +1753,7 @@ async function initApp() {
   setupEventCardLayoutObserver();
   initEventListeners();
   setAuthMode('login');
-  await refreshSession();
+  await ensureSession();
   setInterval(updateApiStatus, 30000);
 }
 

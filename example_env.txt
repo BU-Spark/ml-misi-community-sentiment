@@ -8,6 +8,9 @@ GEMINI_API_KEY=your-gemini-api-key
 GEMINI_MODEL=gemini-2.5-pro
 GEMINI_SUMMARY_MODEL=gemini-2.5-pro
 GEMINI_EMBED_MODEL=models/gemini-embedding-001
+GEMINI_FAST_MODEL=gemini-2.5-flash-lite
+GEMINI_REQUEST_TIMEOUT=20
+GEMINI_MAX_ATTEMPTS=3
 
 # ============================================================================
 # API and session configuration
@@ -19,6 +22,7 @@ API_BASE_URL=http://127.0.0.1:8888
 ALLOWED_ORIGINS=http://127.0.0.1:8000,http://localhost:8000
 FLASK_SECRET_KEY=change-me-in-production
 TOKEN_PEPPER=replace-with-a-separate-secret
+FLASK_DEBUG=false
 FLASK_SESSION_COOKIE_SECURE=false
 AUTH_SESSION_COOKIE_NAME=otp_session
 AUTH_CSRF_COOKIE_NAME=otp_csrf
@@ -29,17 +33,57 @@ AUTH_LOGIN_LOCK_THRESHOLD=5
 AUTH_LOGIN_LOCK_MINUTES=15
 AUTH_ADMIN_EMAILS=
 
+# Guest sessions (tab-scoped Bearer tokens; shorter TTL than registered users)
+GUEST_SESSION_HOURS=24
+SESSION_TOUCH_DEBOUNCE_SECONDS=300
+
+# Request rate limits (uses Redis when CACHE_BACKEND=redis)
+RATE_LIMIT_ENABLED=true
+RATE_LIMIT_GUEST_CREATE_PER_IP=30
+RATE_LIMIT_GUEST_CREATE_WINDOW_SECONDS=3600
+RATE_LIMIT_CHAT_PER_SESSION=60
+RATE_LIMIT_CHAT_WINDOW_SECONDS=3600
+RATE_LIMIT_AUTH_PER_IP=30
+RATE_LIMIT_AUTH_WINDOW_SECONDS=900
+
+# Message size limits
+MAX_MESSAGE_LENGTH=8000
+MAX_COMMUNITY_NOTE_LENGTH=4000
+
+# Orphan guest cleanup (api/cleanup_guest_users.py; also run from cron_ingest.sh)
+GUEST_CLEANUP_ENABLED=false
+GUEST_CLEANUP_INACTIVE_HOURS=24
+GUEST_CLEANUP_BATCH_SIZE=500
+GUEST_CLEANUP_MAX_BATCHES=20
+
 # Legacy compatibility only. New browser clients should use user sessions instead of API keys.
 RETHINKAI_API_KEYS=legacy-api-key-1,legacy-api-key-2
 
 # ============================================================================
-# Google OAuth configuration
+# Production server (gunicorn via ./start_api.sh)
 # ============================================================================
-# Leave these blank if you only want email + password login.
-GOOGLE_OAUTH_CLIENT_ID=
-GOOGLE_OAUTH_CLIENT_SECRET=
-GOOGLE_OAUTH_DISCOVERY_URL=https://accounts.google.com/.well-known/openid-configuration
-GOOGLE_OAUTH_REDIRECT_URI=http://127.0.0.1:8888/auth/google/callback
+GUNICORN_WORKERS=3
+GUNICORN_THREADS=8
+GUNICORN_TIMEOUT=120
+GUNICORN_BIND=127.0.0.1:8888
+
+# ============================================================================
+# Shared cache (required for multi-worker gunicorn deployments)
+# ============================================================================
+CACHE_BACKEND=memory
+REDIS_URL=redis://127.0.0.1:6379/0
+CACHE_TTL_MINUTES=60
+CACHE_MAX_SESSIONS=100
+CACHE_KEY_PREFIX=rethinkai:chatcache:
+
+# Semantic response cache (near-duplicate first-turn questions)
+SEMANTIC_CACHE_ENABLED=false
+SEMANTIC_CACHE_THRESHOLD=0.95
+SEMANTIC_CACHE_TTL_SECONDS=900
+SEMANTIC_CACHE_MAX=200
+
+# Streaming endpoint (client opt-in via public/config.js)
+STREAMING_ENABLED=true
 
 # ============================================================================
 # MySQL database configuration
@@ -49,11 +93,16 @@ MYSQL_PORT=3306
 MYSQL_USER=root
 MYSQL_PASSWORD=your-mysql-password
 MYSQL_DB=rethink_ai_boston
+MYSQL_POOL_SIZE=10
+MYSQL_CONNECT_TIMEOUT=10
 
 # ============================================================================
 # Vector database configuration
 # ============================================================================
 VECTORDB_DIR=../vectordb_new
+PARALLEL_RETRIEVAL=true
+VECTORDB_SINGLETON=true
+CHROMA_MAX_ATTEMPTS=3
 
 # ============================================================================
 # LangChain / LangSmith tracing (optional)

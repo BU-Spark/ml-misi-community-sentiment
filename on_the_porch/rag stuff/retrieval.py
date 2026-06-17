@@ -1,5 +1,8 @@
 import os
 import re
+import sqlite3
+import threading
+import time
 from pathlib import Path
 
 import chromadb
@@ -10,8 +13,27 @@ try:
 except ImportError:
     from langchain_community.vectorstores import Chroma
 
-VECTORDB_DIR = Path("../vectordb_new")
+# Resolve to an absolute path anchored at this file (on_the_porch/vectordb_new)
+# so the location does not depend on the process working directory. The live
+# server still overrides this via _fix_retrieval_vectordb_path(), but resolving
+# here keeps standalone scripts pointed at the same store the server reads.
+VECTORDB_DIR = (Path(__file__).resolve().parent / "../vectordb_new").resolve()
 GEMINI_EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "models/gemini-embedding-001")
+# How many times to retry a vector-store read when SQLite is momentarily locked
+# (e.g. the nightly ingestion cron is writing to the same store).
+_CHROMA_MAX_ATTEMPTS = max(1, int(os.getenv("CHROMA_MAX_ATTEMPTS", "3")))
+# Tracks which vector-store paths have already had WAL mode enabled.
+_WAL_ENABLED_PATHS: set[str] = set()
+
+# Reuse a single Chroma client + embeddings object instead of rebuilding them on
+# every retrieval call (the old behavior rebuilt them 4-6x per question). The
+# client is safe to share across threads for reads. Disable with
+# VECTORDB_SINGLETON=false to fall back to per-call construction.
+_VECTORDB_SINGLETON_ENABLED = os.getenv("VECTORDB_SINGLETON", "true").strip().lower() in ("1", "true", "yes")
+_vectordb_singleton = None
+_vectordb_singleton_path: str | None = None
+_embeddings_singleton = None
+_vectordb_lock = threading.Lock()
 _STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how",
     "i", "in", "is", "it", "me", "of", "on", "or", "that", "the", "this",
@@ -46,14 +68,70 @@ class GeminiEmbeddings:
         return self._embed(text)
 
 
-def load_vectordb():
-    """Load the unified vector database (policies, transcripts, client uploads, etc.)."""
-    embeddings = GeminiEmbeddings()
-    vectordb = Chroma(
-        persist_directory=str(VECTORDB_DIR),
-        embedding_function=embeddings,
+def _is_locked_error(exc: Exception) -> bool:
+    """True when an exception looks like a transient SQLite lock/contention."""
+    message = str(exc).lower()
+    return (
+        "database is locked" in message
+        or "database is busy" in message
+        or "disk i/o error" in message
     )
-    return vectordb
+
+
+def _ensure_sqlite_wal() -> None:
+    """Best-effort: put the Chroma SQLite store into WAL mode.
+
+    WAL (Write-Ahead Logging) lets the live server keep *reading* while the
+    nightly ingestion cron *writes* to the same store, instead of failing with
+    "database is locked". journal_mode=WAL is persisted in the database header,
+    so this only needs to succeed once; we track it per path and retry until it
+    does. This is intentionally non-fatal — if it can't be set we simply rely on
+    the read-retry logic below.
+    """
+    try:
+        path_str = str(Path(VECTORDB_DIR).resolve())
+    except Exception:
+        return
+    if path_str in _WAL_ENABLED_PATHS:
+        return
+    db_path = Path(VECTORDB_DIR) / "chroma.sqlite3"
+    if not db_path.exists():
+        return
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=30)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=30000;")
+        finally:
+            conn.close()
+        _WAL_ENABLED_PATHS.add(path_str)
+    except Exception as exc:
+        print(f"  ⚠️ Could not enable SQLite WAL on vector store: {exc}")
+
+
+def load_vectordb():
+    """Load the unified vector database (policies, transcripts, client uploads, etc.).
+
+    Returns a cached singleton keyed by the current VECTORDB_DIR. If the path
+    changes (the live server overrides it at startup), the client is rebuilt.
+    """
+    _ensure_sqlite_wal()
+
+    if not _VECTORDB_SINGLETON_ENABLED:
+        return Chroma(persist_directory=str(VECTORDB_DIR), embedding_function=GeminiEmbeddings())
+
+    global _vectordb_singleton, _vectordb_singleton_path, _embeddings_singleton
+    current_path = str(VECTORDB_DIR)
+    with _vectordb_lock:
+        if _vectordb_singleton is None or _vectordb_singleton_path != current_path:
+            if _embeddings_singleton is None:
+                _embeddings_singleton = GeminiEmbeddings()
+            _vectordb_singleton = Chroma(
+                persist_directory=current_path,
+                embedding_function=_embeddings_singleton,
+            )
+            _vectordb_singleton_path = current_path
+        return _vectordb_singleton
 
 
 def _normalize_query_terms(text: str) -> list[str]:
@@ -221,10 +299,7 @@ def retrieve(query, k=5, doc_type=None, tags=None, source=None, min_score=None, 
     elif source:
         filter_dict = {"source": source}
 
-    try:
-        if vectordb is None:
-            vectordb = load_vectordb()
-
+    def _do_semantic_search(vectordb):
         # Retrieve with or without score threshold
         if min_score is not None:
             results_with_scores = vectordb.similarity_search_with_score(
@@ -279,9 +354,21 @@ def retrieve(query, k=5, doc_type=None, tags=None, source=None, min_score=None, 
             "scores": None,
             "query": query,
         }
-    except Exception as exc:
-        print(f"  ⚠️ Semantic retrieval failed, falling back to keyword search: {exc}")
-        return _keyword_retrieve(query, k=k, doc_type=doc_type, tags=tags, source=source)
+
+    # The nightly ingestion cron writes to the same SQLite-backed store. A
+    # concurrent write can momentarily lock the DB; rather than immediately
+    # degrading to keyword search, wait out a transient lock and retry.
+    for attempt in range(1, _CHROMA_MAX_ATTEMPTS + 1):
+        try:
+            db = vectordb if vectordb is not None else load_vectordb()
+            return _do_semantic_search(db)
+        except Exception as exc:
+            if _is_locked_error(exc) and attempt < _CHROMA_MAX_ATTEMPTS:
+                print(f"  ⏳ Vector store busy (attempt {attempt}/{_CHROMA_MAX_ATTEMPTS}): {exc}; retrying")
+                time.sleep(min(2 ** (attempt - 1), 4) * 0.25)
+                continue
+            print(f"  ⚠️ Semantic retrieval failed, falling back to keyword search: {exc}")
+            return _keyword_retrieve(query, k=k, doc_type=doc_type, tags=tags, source=source)
 
 
 def retrieve_transcripts(query, tags=None, k=5):

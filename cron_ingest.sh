@@ -31,6 +31,19 @@ if [ ! -f ".env" ]; then
   exit 1
 fi
 
+# Prevent overlapping ingestion runs. If a run is slow, the next scheduled run
+# must not start and double-write to the vector store / MySQL tables.
+LOCK_FILE="$LOG_DIR/cron_ingest.lock"
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    log "Another ingestion run is already in progress; exiting."
+    exit 0
+  fi
+else
+  log "WARNING: 'flock' not available; skipping overlap protection."
+fi
+
 run_step() {
   local label="$1"
   shift
@@ -61,5 +74,9 @@ run_step \
 run_step \
   "Google Drive ingestion" \
   "$PYTHON" "on_the_porch/data_ingestion/google_drive_to_vectordb.py"
+
+run_step \
+  "Orphan guest user cleanup" \
+  "$PYTHON" "api/cleanup_guest_users.py"
 
 log "Cron ingestion job finished successfully"

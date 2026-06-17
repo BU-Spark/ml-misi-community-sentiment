@@ -22,8 +22,9 @@ DEFAULT_POLICY_DIR = Path("Data/VectorDB_text")
 DEFAULT_TRANSCRIPT_DIR = Path("Data/AI meeting transcripts")
 DEFAULT_NEWSLETTER_DIR = Path("Data/newsletters")
 
-# Shared vector DB used by the chatbot (must match retrieval.py)
-DEFAULT_VECTORDB_DIR = Path("../vectordb_new")
+# Shared vector DB used by the chatbot (must match retrieval.py). Resolved
+# relative to this file so it does not depend on the process working directory.
+DEFAULT_VECTORDB_DIR = (_RAG_DIR / "../vectordb_new").resolve()
 
 
 def _get_gemini_client():

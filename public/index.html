@@ -8,10 +8,10 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Manrope:wght@400;500;600;700&family=Syne:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="styles.css?v=20260425d">
+  <link rel="stylesheet" href="styles.css?v=20260601f">
 </head>
 <body>
-  <div class="auth-shell" id="auth-view">
+  <div class="auth-shell" id="auth-view" hidden>
     <div class="auth-layout">
       <section class="auth-hero auth-hero--photo">
         <div class="auth-hero-overlay"></div>
@@ -48,6 +48,8 @@
           <h2 class="auth-title">Welcome Back</h2>
           <p class="auth-subtitle">Access your local intelligence feed.</p>
 
+          <button class="auth-back-link" id="auth-back-to-chat" type="button" hidden>← Back to chat</button>
+
           <div class="auth-tabs">
             <button class="auth-tab active" id="tab-login" type="button">Login</button>
             <button class="auth-tab" id="tab-signup" type="button">Sign Up</button>
@@ -83,17 +85,12 @@
 
           <div class="auth-divider"><span>or</span></div>
 
-          <button class="btn-secondary auth-google" id="google-auth-button" type="button">
-            <span class="google-mark" aria-hidden="true">
-              <svg xmlns="http://www.w3.org/2000/svg" x="0px" y="0px" width="100" height="100" viewBox="0 0 48 48">
-                <path fill="#FFC107" d="M43.611,20.083H42V20H24v8h11.303c-1.649,4.657-6.08,8-11.303,8c-6.627,0-12-5.373-12-12c0-6.627,5.373-12,12-12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C12.955,4,4,12.955,4,24c0,11.045,8.955,20,20,20c11.045,0,20-8.955,20-20C44,22.659,43.862,21.35,43.611,20.083z"></path><path fill="#FF3D00" d="M6.306,14.691l6.571,4.819C14.655,15.108,18.961,12,24,12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C16.318,4,9.656,8.337,6.306,14.691z"></path><path fill="#4CAF50" d="M24,44c5.166,0,9.86-1.977,13.409-5.192l-6.19-5.238C29.211,35.091,26.715,36,24,36c-5.202,0-9.619-3.317-11.283-7.946l-6.522,5.025C9.505,39.556,16.227,44,24,44z"></path><path fill="#1976D2" d="M43.611,20.083H42V20H24v8h11.303c-0.792,2.237-2.231,4.166-4.087,5.571c0.001-0.001,0.002-0.001,0.003-0.002l6.19,5.238C36.971,39.205,44,34,44,24C44,22.659,43.862,21.35,43.611,20.083z"></path>
-                </svg>
-            </span>
-            <span>Continue with Google</span>
+          <button class="btn-secondary auth-guest" id="guest-continue-button" type="button">
+            Continue as Guest
           </button>
 
           <div class="auth-error" id="auth-error" hidden></div>
-          <p class="auth-note">Use a local password or Google sign-in. Accounts and saved conversations stay scoped to the signed-in user.</p>
+          <p class="auth-note">Sign in to save conversations across sessions, or continue as a guest for a temporary chat in this tab.</p>
         </div>
       </section>
       <button class="btn-icon btn-theme-toggle auth-layout-theme-toggle" data-theme-toggle type="button" aria-label="Switch to light mode" title="Switch to light mode">
@@ -144,7 +141,7 @@
     </div>
   </div>
 
-  <div class="app-container" id="app-view" hidden>
+  <div class="app-container" id="app-view">
     <aside class="sidebar">
       <div class="sidebar-shell">
         <div class="sidebar-top">
@@ -213,9 +210,7 @@
               <div class="account-email" id="account-email">—</div>
             </div>
           </div>
-          <div class="account-providers" id="account-providers"></div>
           <div class="account-actions">
-            <button class="btn-secondary btn-secondary--ghost small" id="google-link-toggle" type="button">Link Google</button>
             <button class="btn-secondary btn-secondary--ghost small" id="logout-button" type="button">Log Out</button>
           </div>
         </section>
@@ -235,6 +230,7 @@
             <span class="theme-toggle-icon" aria-hidden="true">☀</span>
             <span class="sr-only">Toggle theme</span>
           </button>
+          <button class="btn-secondary small header-login-button" id="login-button" type="button">Log In</button>
           <button class="btn-icon btn-panel-toggle" id="events-panel-toggle" type="button" aria-label="Collapse events panel" title="Collapse events panel">
             <span class="panel-toggle-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -256,31 +252,31 @@
       <div class="chat-stage">
         <div class="chat-messages" id="chat-messages"></div>
         <div class="error-banner" id="chat-error" hidden></div>
-      </div>
 
-      <div class="chat-input-container">
-        <form id="chat-form" class="chat-form">
-          <div class="input-wrapper">
-            <input
-              type="text"
-              id="chat-input"
-              placeholder="Ask about events, services, safety, or neighborhood trends..."
-              autocomplete="off"
-              aria-label="Chat input"
-            >
-            <button class="btn-send" id="chat-submit" type="submit" aria-label="Send message">
-              <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
-                <path d="M18 2L9 11M18 2L12 18L9 11M18 2L2 8L9 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
-            </button>
-          </div>
+        <div class="chat-input-container">
+          <form id="chat-form" class="chat-form">
+            <div class="input-wrapper">
+              <input
+                type="text"
+                id="chat-input"
+                placeholder="Ask about events, services, safety, or neighborhood trends..."
+                autocomplete="off"
+                aria-label="Chat input"
+              >
+              <button class="btn-send" id="chat-submit" type="submit" aria-label="Send message">
+                <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+                  <path d="M18 2L9 11M18 2L12 18L9 11M18 2L2 8L9 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </button>
+            </div>
 
-          <div class="suggestions" id="suggestions">
-            <button class="suggestion-chip" type="button" data-query="What events are happening this week?">Events this week</button>
-            <button class="suggestion-chip" type="button" data-query="How many 311 requests were filed last month?">311 activity</button>
-            <button class="suggestion-chip" type="button" data-query="What are the main safety concerns in Dorchester?">Safety overview</button>
-          </div>
-        </form>
+            <div class="suggestions" id="suggestions">
+              <button class="suggestion-chip" type="button" data-query="What events are happening this week?">Events this week</button>
+              <button class="suggestion-chip" type="button" data-query="How many 311 requests were filed last month?">311 activity</button>
+              <button class="suggestion-chip" type="button" data-query="What are the main safety concerns in Dorchester?">Safety overview</button>
+            </div>
+          </form>
+        </div>
       </div>
     </main>
 
@@ -370,10 +366,11 @@
 
   <div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="true"></div>
 
-  <script src="config.js?v=20260317c"></script>
-  <script src="api.js?v=20260317c"></script>
+  <script src="config.js?v=20260601d"></script>
+  <script src="instantReplies.js?v=20260601a"></script>
+  <script src="api.js?v=20260601c"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.7/dist/purify.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked@15.0.7/marked.min.js"></script>
-  <script src="app.js?v=20260422d"></script>
+  <script src="app.js?v=20260601f"></script>
 </body>
 </html>

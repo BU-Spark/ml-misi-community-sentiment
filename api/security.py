@@ -119,9 +119,9 @@ def serialize_user(row: dict[str, Any] | None, linked_providers: Iterable[str] |
         "role": row["role"],
         "status": row["status"],
         "profile_complete": bool(row.get("profile_complete", False)),
+        "is_guest": bool(row.get("is_guest", False)),
         "linked_providers": providers,
         "has_password": "password" in providers,
-        "has_google": "google" in providers,
         "last_login_at": row.get("last_login_at").isoformat() if row.get("last_login_at") else None,
         "created_at": row.get("created_at").isoformat() if row.get("created_at") else None,
     }

@@ -2,6 +2,8 @@ import os
 import sys
 import json
 import re
+import time
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Callable
 
@@ -39,9 +41,24 @@ _load_local_env()
 
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 GEMINI_SUMMARY_MODEL = os.getenv("GEMINI_SUMMARY_MODEL", GEMINI_MODEL)
 SQL_MAX_RETRIES = int(os.getenv("SQL_MAX_RETRIES", "2"))  # Reduced default to 2 for faster execution
+# How many times to attempt a Gemini call / MySQL connection before giving up.
+# Transient upstream errors (rate limits, 5xx, timeouts) are retried with backoff.
+GEMINI_MAX_ATTEMPTS = max(1, int(os.getenv("GEMINI_MAX_ATTEMPTS", "2")))
+DB_MAX_ATTEMPTS = max(1, int(os.getenv("DB_MAX_ATTEMPTS", "3")))
+# Per-call wall-clock timeout (seconds) for a single Gemini request, so a stuck
+# upstream call cannot hang a worker thread indefinitely.
+GEMINI_REQUEST_TIMEOUT = int(os.getenv("GEMINI_REQUEST_TIMEOUT", "20"))
+# Cheaper/faster model for classification (table selection). Defaults to the
+# main model so behavior is unchanged until you point it at a lighter model.
+GEMINI_FAST_MODEL = os.getenv("GEMINI_FAST_MODEL", GEMINI_MODEL)
+# Cache the DB schema snapshot (it changes rarely) instead of re-querying
+# information_schema on every single question.
+SCHEMA_CACHE_TTL_SECONDS = int(os.getenv("SCHEMA_CACHE_TTL_SECONDS", "300"))
+_schema_cache: Dict[str, Any] = {}
+_schema_cache_lock = threading.Lock()
 
 # Optional LangSmith tracing
 try:
@@ -76,18 +93,106 @@ def _get_gemini_client():
     return genai
 
 
+_TRANSIENT_ERROR_MARKERS = (
+    "429", "rate limit", "quota", "resource exhausted", "exhausted",
+    "500", "502", "503", "504", "internal error", "unavailable",
+    "deadline", "timeout", "timed out", "temporarily",
+)
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """Heuristically decide whether an upstream error is worth retrying."""
+    message = str(exc).lower()
+    return any(marker in message for marker in _TRANSIENT_ERROR_MARKERS)
+
+
+def _safe_extract_response_text(response: Any) -> str:
+    """Safely pull text out of a Gemini response.
+
+    Accessing ``response.text`` raises (e.g. ``ValueError``) when the candidate
+    has no parts or has multiple parts — for example when a response is blocked
+    by safety filters. We must never let that bubble up as a 500, so we fall
+    back to manually concatenating candidate parts and finally to "".
+    """
+    try:
+        text = getattr(response, "text", "")
+        if text:
+            return text.strip()
+    except Exception:
+        pass
+
+    try:
+        collected: List[str] = []
+        for candidate in getattr(response, "candidates", None) or []:
+            content = getattr(candidate, "content", None)
+            for part in getattr(content, "parts", None) or []:
+                piece = getattr(part, "text", "")
+                if piece:
+                    collected.append(piece)
+        return "".join(collected).strip()
+    except Exception:
+        return ""
+
+
+_GEMINI_SUPPORTS_REQUEST_OPTIONS = True
+
+
+def _generate_content(model, prompt, generation_config):
+    """Call ``model.generate_content`` with a per-request timeout when supported.
+
+    google-generativeai versions differ on whether they accept
+    ``request_options``. If the installed version rejects it we transparently
+    fall back to a plain call so an unexpected kwarg never crashes a request.
+    """
+    global _GEMINI_SUPPORTS_REQUEST_OPTIONS
+    if _GEMINI_SUPPORTS_REQUEST_OPTIONS:
+        try:
+            return model.generate_content(
+                prompt,
+                generation_config=generation_config,
+                request_options={"timeout": GEMINI_REQUEST_TIMEOUT},
+            )
+        except TypeError:
+            _GEMINI_SUPPORTS_REQUEST_OPTIONS = False
+    return model.generate_content(prompt, generation_config=generation_config)
+
+
 @traceable(name="gemini_chat")
 def _chat_with_model(user_message: str, model_name: str = GEMINI_MODEL, temperature: float = 0) -> str:
     """
     Single Gemini call wrapped with LangSmith's @traceable.
     This follows the pattern you provided and also logs token usage when available.
+
+    Transient upstream failures (rate limits, 5xx, timeouts) are retried with
+    exponential backoff. Response text is extracted defensively so a
+    safety-blocked or empty response degrades to "" instead of raising.
     """
     client = _get_gemini_client()
     model = client.GenerativeModel(model_name)
-    response = model.generate_content(
-        user_message,
-        generation_config={"temperature": temperature},
-    )
+
+    response = None
+    last_exc: Exception | None = None
+    for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+        try:
+            response = _generate_content(
+                model,
+                user_message,
+                {"temperature": temperature},
+            )
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt < GEMINI_MAX_ATTEMPTS and _is_transient_error(exc):
+                backoff = min(2 ** (attempt - 1), 8) * 0.5
+                print(
+                    f"  ⚠️ Gemini transient error (attempt {attempt}/{GEMINI_MAX_ATTEMPTS}): "
+                    f"{exc}; retrying in {backoff:.1f}s"
+                )
+                time.sleep(backoff)
+                continue
+            raise
+    if response is None:  # pragma: no cover - defensive; loop either breaks or raises
+        raise RuntimeError(f"Gemini call failed: {last_exc}")
 
     # Extract token usage and attach to current trace (if any)
     try:
@@ -116,7 +221,7 @@ def _chat_with_model(user_message: str, model_name: str = GEMINI_MODEL, temperat
     except Exception:
         pass
 
-    return (getattr(response, "text", "") or "").strip()
+    return _safe_extract_response_text(response)
 
 
 def _call_gemini_with_logging(model_name: str, prompt: str, temperature: float = 0) -> str:
@@ -126,35 +231,81 @@ def _call_gemini_with_logging(model_name: str, prompt: str, temperature: float =
     return _chat_with_model(prompt, model_name=model_name, temperature=temperature)
 
 
-def _get_db_connection():
-    """
-    Get a MySQL connection.
+# One reusable MySQL connection per worker thread. Reusing a live connection
+# (instead of opening a brand-new one for every query) avoids connection churn
+# that — during hybrid queries plus the nightly cron — could exhaust MySQL's
+# max_connections and turn into connect failures.
+_db_thread_local = threading.local()
 
-    Defaults are chosen to work out of the box with the Docker command we set up:
-      host=localhost, port=3306, user=root, password="", database=sl_data
-    You can override with MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DB.
-    """
+
+def _connect_mysql():
+    """Open a brand-new MySQL connection, retrying transient failures."""
     host = os.environ.get("MYSQL_HOST", "127.0.0.1")
     port = int(os.environ.get("MYSQL_PORT", "3306"))
     user = os.environ.get("MYSQL_USER", "root")
     password = os.environ.get("MYSQL_PASSWORD", "")
     db_name = os.environ.get("MYSQL_DB", "rethink_ai_boston")
 
-    try:
-        conn = pymysql.connect(
-            host=host,
-            port=port,
-            user=user,
-            password=password,
-            database=db_name,
-            charset="utf8mb4",
-            cursorclass=pymysql.cursors.Cursor,
-            autocommit=True,
-        )
-    except Exception as exc:
-        print(f"MySQL connection failed: {exc}", file=sys.stderr)
-        sys.exit(1)
+    last_exc: Exception | None = None
+    for attempt in range(1, DB_MAX_ATTEMPTS + 1):
+        try:
+            return pymysql.connect(
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                database=db_name,
+                charset="utf8mb4",
+                cursorclass=pymysql.cursors.Cursor,
+                autocommit=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            print(
+                f"MySQL connection failed (attempt {attempt}/{DB_MAX_ATTEMPTS}): {exc}",
+                file=sys.stderr,
+            )
+            if attempt < DB_MAX_ATTEMPTS:
+                time.sleep(min(2 ** (attempt - 1), 4) * 0.5)
 
+    # Do NOT sys.exit here: that raises SystemExit (a BaseException), which the
+    # API's `except Exception` handlers cannot catch, killing the worker on a
+    # transient DB blip. Raise a normal exception so the request fails cleanly
+    # with a 500 JSON response while the worker stays alive.
+    raise RuntimeError(
+        f"MySQL connection failed after {DB_MAX_ATTEMPTS} attempts: {last_exc}"
+    )
+
+
+def _get_db_connection():
+    """
+    Return a live, reusable per-thread MySQL connection.
+
+    The connection is verified with ``ping(reconnect=True)`` before being
+    handed back, so a connection the server has dropped (after ``wait_timeout``)
+    is transparently re-established instead of raising "MySQL server has gone
+    away". Callers must NOT close the returned connection — it is owned by the
+    thread and reused across queries. autocommit is on, so there is never a
+    lingering transaction between borrows.
+
+    You can override connection details with MYSQL_HOST, MYSQL_PORT, MYSQL_USER,
+    MYSQL_PASSWORD, MYSQL_DB.
+    """
+    conn = getattr(_db_thread_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.ping(reconnect=True)
+            return conn
+        except Exception:
+            # Stale/broken beyond reconnect — drop it and open a fresh one.
+            try:
+                conn.close()
+            except Exception:
+                pass
+            _db_thread_local.conn = None
+
+    conn = _connect_mysql()
+    _db_thread_local.conn = conn
     return conn
 
 
@@ -165,20 +316,25 @@ def _fetch_schema_snapshot(database: str) -> str:
     The `database` argument is kept for API compatibility but the active
     database comes from the MySQL connection itself.
     """
+    cache_key = os.environ.get("MYSQL_DB", "rethink_ai_boston")
+    now = time.time()
+    with _schema_cache_lock:
+        entry = _schema_cache.get(cache_key)
+        if entry and entry[0] > now:
+            return entry[1]
+
     conn = _get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT table_name, column_name
-                FROM information_schema.columns
-                WHERE table_schema = DATABASE()
-                ORDER BY table_name, ordinal_position
-                """
-            )
-            rows = cur.fetchall()
-    finally:
-        conn.close()
+    # Connection is thread-owned and reused; do not close it here.
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT table_name, column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+            ORDER BY table_name, ordinal_position
+            """
+        )
+        rows = cur.fetchall()
 
     table_to_columns: Dict[str, List[str]] = {}
     for table_name, column_name in rows:
@@ -187,12 +343,17 @@ def _fetch_schema_snapshot(database: str) -> str:
     lines: List[str] = []
     for table_name, columns in table_to_columns.items():
         lines.append(f"{table_name} (" + ", ".join(columns) + ")")
-    return "\n".join(lines) if lines else "(no tables)"
+    snapshot = "\n".join(lines) if lines else "(no tables)"
+
+    with _schema_cache_lock:
+        _schema_cache[cache_key] = (now + SCHEMA_CACHE_TTL_SECONDS, snapshot)
+    return snapshot
 
 
 def _get_unique_values(table_name: str, column_name: str, schema: str = "public", limit: int = 50) -> List[Any]:
     """Get unique values from a column to help users see available options."""
     conn = _get_db_connection()
+    # Connection is thread-owned and reused; do not close it here.
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -211,13 +372,12 @@ def _get_unique_values(table_name: str, column_name: str, schema: str = "public"
         # If query times out or fails, return empty list
         print(f"[Warning] Could not fetch unique values for {table_name}.{column_name}: {exc}", file=sys.stderr)
         return []
-    finally:
-        conn.close()
 
 
 def _fetch_active_admin_knowledge(limit: int = 10) -> List[Dict[str, Any]]:
     """Fetch recent active admin/community notes for answer-time context."""
     conn = _get_db_connection()
+    # Connection is thread-owned and reused; do not close it here.
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -254,8 +414,6 @@ def _fetch_active_admin_knowledge(limit: int = 10) -> List[Dict[str, Any]]:
     except Exception as exc:
         print(f"[Warning] Could not fetch admin knowledge: {exc}", file=sys.stderr)
         return []
-    finally:
-        conn.close()
 
 
 def _format_admin_knowledge_context(notes: List[Dict[str, Any]], max_notes: int = 8) -> str:
@@ -506,11 +664,134 @@ def _read_selected_metadata_json(selected_tables: List[str], catalog: List[Dict[
         return ""
 
 
+def is_generic_events_list_question(question: str) -> bool:
+    """True for broad upcoming-events questions (e.g. 'events this week')."""
+    q = (question or "").lower().strip()
+    if not q:
+        return False
+
+    event_hints = (
+        "event", "events", "happening", "going on", "what's on", "whats on",
+        "calendar", "schedule", "activities", "activity", "things to do",
+        "workshop", "workshops", "meeting", "meetings",
+    )
+    if not any(h in q for h in event_hints):
+        return False
+
+    if any(m in q for m in ("tell me about", "more about", "details about", "when is the", "where is the")):
+        return False
+    if '"' in q or "'" in q:
+        return False
+
+    time_hints = (
+        "this week", "next week", "today", "tomorrow", "weekend",
+        "upcoming", "coming up", "this month", "next month",
+    )
+    list_patterns = (
+        "what events", "any events", "events are", "show me events",
+        "list events", "events happening", "what's happening", "whats happening",
+        "what is happening", "going on this",
+    )
+    return any(t in q for t in time_hints) or any(p in q for p in list_patterns)
+
+
+def _events_list_days_ahead(question: str) -> int:
+    q = (question or "").lower()
+    if "today" in q:
+        return 1
+    if "tomorrow" in q:
+        return 2
+    if "this weekend" in q or ("weekend" in q and "next" not in q):
+        return 7
+    if "this week" in q:
+        return 7
+    if "next week" in q:
+        return 14
+    if "this month" in q:
+        return 30
+    if "next month" in q:
+        return 60
+    return 14
+
+
+def _fast_weekly_events_sql(days_ahead: int) -> str:
+    days = max(1, min(int(days_ahead), 90))
+    return (
+        "SELECT `event_name`, `event_date`, `start_date`, `end_date`, "
+        "`start_time`, `end_time`, `raw_text`, `source_pdf` "
+        "FROM `weekly_events` "
+        "WHERE `start_date` >= CURDATE() "
+        f"AND `start_date` <= DATE_ADD(CURDATE(), INTERVAL {days} DAY) "
+        "ORDER BY `start_date` ASC, `start_time` ASC "
+        "LIMIT 50"
+    )
+
+
+def _format_events_answer_fallback(question: str, result: Dict[str, Any]) -> str:
+    rows = result.get("rows", []) if isinstance(result, dict) else []
+    if not rows:
+        return (
+            "I didn't find any upcoming events for that time period. "
+            "Try asking about a wider date range or check back later."
+        )
+    lines = ["Here are upcoming events I found:\n"]
+    for row in rows[:25]:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("event_name") or "Event"
+        date_label = row.get("event_date") or row.get("start_date") or ""
+        start_time = row.get("start_time") or ""
+        when = date_label
+        if start_time:
+            when = f"{date_label}, {start_time}" if date_label else str(start_time)
+        lines.append(f"- **{name}**" + (f" — {when}" if when else ""))
+        snippet = (row.get("raw_text") or "").strip()
+        if snippet:
+            lines.append(f"  {snippet[:240]}")
+    return "\n".join(lines)
+
+
+def run_generic_events_query(
+    question: str,
+    conversation_history: List[Dict[str, str]] | None = None,
+) -> Dict[str, Any]:
+    """Fetch upcoming events with a direct SQL query (no LLM SQL generation)."""
+    days = _events_list_days_ahead(question)
+    sql = _fast_weekly_events_sql(days)
+    print(f"\n[Fast events SQL — next {days} days]\n{sql}\n")
+    try:
+        result = _execute_sql(sql)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ⚠️ Fast events SQL failed: {exc}")
+        return {
+            "answer": "I couldn't load events from the calendar right now. Please try again shortly.",
+            "sql": sql,
+            "result": {"columns": [], "rows": [], "error": str(exc)},
+        }
+
+    try:
+        answer = _llm_generate_answer(
+            question,
+            sql,
+            result,
+            GEMINI_SUMMARY_MODEL,
+            conversation_history,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ⚠️ Events answer generation failed ({exc}); using template fallback")
+        answer = _format_events_answer_fallback(question, result)
+
+    if not (answer or "").strip():
+        answer = _format_events_answer_fallback(question, result)
+
+    return {"answer": answer.strip(), "sql": sql, "result": result}
+
+
 def _build_question_metadata(question: str) -> str:
     catalog = _load_catalog_entries()
     if not catalog:
         return _read_metadata_text()
-    tables = _llm_select_tables(question, catalog, GEMINI_MODEL)
+    tables = _llm_select_tables(question, catalog, GEMINI_FAST_MODEL)
     meta = _read_selected_metadata_json(tables, catalog)
     return meta or _read_metadata_text()
 
@@ -602,7 +883,8 @@ def _llm_generate_sql(question: str, schema: str, default_model: str, metadata: 
         print("\n[Generated SQL After Dorchester Filter]\n" + sql + "\n")
         return sql
     except Exception as exc:
-        raise RuntimeError(f"Gemini error: {exc}")
+        print(f"  ⚠️ Gemini SQL generation failed: {exc}")
+        raise
 
 
 @traceable(name="refine_sql_on_error")
@@ -696,13 +978,13 @@ def _llm_refine_sql(
 @traceable(name="execute_sql")
 def _execute_sql(sql: str) -> Dict[str, Any]:
     conn = _get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-            rows = cur.fetchall()
-            cols = [d[0] for d in cur.description] if cur.description else []
-    finally:
-        conn.close()
+    # Connection is thread-owned and reused; do not close it here. A statement
+    # error leaves the connection usable (autocommit, no open transaction); the
+    # next borrow re-pings and reconnects if the socket was dropped.
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description] if cur.description else []
 
     items: List[Dict[str, Any]] = []
     for row in rows:

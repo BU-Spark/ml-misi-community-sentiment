@@ -2103,6 +2103,13 @@
           return;
         }
         if (failed.status === 403) {
+          if (failed.data?.code === 'guest_not_allowed') {
+            setAccess(
+              'Admin sign-in required',
+              'Guest sessions cannot access the admin dashboard. Sign in with an admin account from the main app, then return here.',
+            );
+            return;
+          }
           setAccess('Admin access required', 'Your current account is signed in, but it does not have the admin role.', failed.error, true);
           return;
         }
@@ -2132,6 +2139,14 @@
 
       if (!session.data.authenticated || !session.data.user) {
         setAccess('Sign in required', 'Sign in through the main app first, then return here.');
+        return;
+      }
+
+      if (session.data.is_guest || session.data.user.is_guest) {
+        setAccess(
+          'Admin sign-in required',
+          'Guest sessions cannot access the admin dashboard. Sign in with an admin account from the main app, then return here.',
+        );
         return;
       }
 

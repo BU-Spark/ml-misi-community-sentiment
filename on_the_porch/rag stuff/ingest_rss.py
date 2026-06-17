@@ -42,7 +42,9 @@ from retrieval import GeminiEmbeddings  # noqa: E402  (same embeddings as the re
  
 # ── config ───────────────────────────────────────────────────────────────────
  
-DEFAULT_VECTORDB_DIR = Path("../vectordb_new")
+# Resolve relative to this file so it always points at on_the_porch/vectordb_new
+# regardless of the process working directory (the cron runs from the repo root).
+DEFAULT_VECTORDB_DIR = (_RAG_DIR / "../vectordb_new").resolve()
 RSS_FEEDS: list[dict] = [
     {
         "url":    "https://www.dotnews.com/feed/",         

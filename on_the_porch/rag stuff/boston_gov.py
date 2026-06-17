@@ -50,6 +50,25 @@ def _stable_boston_gov_doc_id(question: str, answer: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
+def _empty_boston_gov_result(
+    final_query: str, search_url: str = ""
+) -> Dict[str, List[Dict[str, str]] | List[str] | str]:
+    """Return an empty-but-well-formed result so callers can always use ``.get``.
+
+    Every code path must return the same dict shape; returning a bare list here
+    previously caused ``'list' object has no attribute 'get'`` crashes in the
+    chatbot fallback flow.
+    """
+    return {
+        "query": final_query,
+        "search_url": search_url,
+        "paragraphs": [],
+        "bullet_points": [],
+        "links": [],
+        "text": "",
+    }
+
+
 def _clean_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text
@@ -121,18 +140,12 @@ def get_boston_gov_ai_answer(question: str) -> Dict[str, List[Dict[str, str]] | 
         response.raise_for_status()
     except Exception as exc:
         print(f"⚠️ Warning: Boston.gov fallback search request failed: {exc}")
-        return []
+        return _empty_boston_gov_result(final_query, search_url)
 
     html_text = response.text or ""
     if not html_text:
         print("⚠️ Warning: Boston.gov fallback returned an empty search page.")
-        return {
-            "query": final_query,
-            "paragraphs": [],
-            "bullet_points": [],
-            "links": [],
-            "text": "",
-        }
+        return _empty_boston_gov_result(final_query, search_url)
 
     data = _extract_boston_gov_ai_answer(html_text)
     paragraphs = data["paragraphs"]

@@ -1,6 +1,9 @@
 import os
+import re
 import sys
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -30,8 +33,16 @@ except Exception:  # pragma: no cover
     genai = None  # type: ignore
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 GEMINI_SUMMARY_MODEL = os.getenv("GEMINI_SUMMARY_MODEL", GEMINI_MODEL)
+# Cheaper/faster model for internal classification tasks (routing, the
+# needs-new-data gate, relevance classification). Defaults to GEMINI_MODEL so
+# behavior is unchanged until you point it at a lighter model (e.g. a -lite).
+GEMINI_FAST_MODEL = os.getenv("GEMINI_FAST_MODEL", GEMINI_MODEL)
+GEMINI_REQUEST_TIMEOUT = int(os.getenv("GEMINI_REQUEST_TIMEOUT", "20"))
+_GEMINI_SUPPORTS_REQUEST_OPTIONS = True
+# Run independent retrievals (and hybrid SQL+RAG) concurrently for lower latency.
+_PARALLEL_RETRIEVAL = os.getenv("PARALLEL_RETRIEVAL", "true").strip().lower() in ("1", "true", "yes")
 FALLBACK_TRIGGER_PREFIX = "i did not find exact information"
 SQL_FALLBACK_TRIGGER_PHRASES = (
     FALLBACK_TRIGGER_PREFIX,
@@ -49,6 +60,109 @@ BOSTON_GOV_BOILERPLATE_PATTERNS = (
     "relevant pages and more information",
     "find links",
 )
+
+# Short greetings / pleasantries — answered instantly without routing or retrieval.
+_SMALL_TALK_EXACT = frozenset({
+    "hi", "hello", "hey", "yo", "hiya", "howdy", "sup",
+    "thanks", "thank you", "thx", "ty",
+    "bye", "goodbye", "cya", "see ya", "see you",
+    "ok", "okay", "cool", "great", "help",
+})
+_SMALL_TALK_PATTERNS = (
+    r"^(hi|hello|hey|yo|hiya|howdy)\s*(there|everyone|friend)?$",
+    r"^how are you$",
+    r"^how r u$",
+    r"^how(?:'re| is) you$",
+    r"^how(?:'s| is) it going$",
+    r"^what(?:'s| is) up$",
+    r"^good (morning|afternoon|evening|night)$",
+    r"^who are you$",
+    r"^what are you$",
+    r"^what can you (do|help with)$",
+    r"^how does this work$",
+    r"^how do i use this$",
+    r"^what is this$",
+    r"^what do you do$",
+)
+_SMALL_TALK_DOMAIN_HINTS = (
+    "event", "311", "911", "crime", "safety", "dorchester", "news",
+    "meeting", "happening", "request", "neighborhood", "budget", "policy",
+    "arrest", "shooting", "calendar", "schedule", "activity", "service",
+)
+
+
+def _normalize_small_talk(message: str) -> str:
+    text = (message or "").strip().lower()
+    text = re.sub(r"[^\w\s']", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def is_small_talk(message: str) -> bool:
+    """True when the message is a brief greeting or pleasantry, not a data question."""
+    raw = (message or "").strip()
+    if not raw or len(raw) > 120:
+        return False
+    lower = raw.lower()
+    if any(hint in lower for hint in _SMALL_TALK_DOMAIN_HINTS):
+        return False
+    normalized = _normalize_small_talk(raw)
+    if not normalized:
+        return False
+    if normalized in _SMALL_TALK_EXACT:
+        return True
+    return any(re.fullmatch(pat, normalized) for pat in _SMALL_TALK_PATTERNS)
+
+
+def small_talk_response(message: str) -> str:
+    """Instant reply for greetings and other brief non-data messages."""
+    n = _normalize_small_talk(message)
+    if any(x in n for x in ("how are you", "how r u", "how is it going", "how's it going")):
+        return (
+            "I'm doing well — thanks for asking! I'm here to help with Dorchester community "
+            "info: events, 311 activity, safety trends, and neighborhood news. "
+            "What would you like to know?"
+        )
+    if n.startswith(("thanks", "thank you", "thx", "ty")) or n in ("thanks", "thank you", "thx", "ty"):
+        return (
+            "You're welcome! Ask anytime about events, city services, safety, or what's "
+            "happening in the neighborhood."
+        )
+    if n.startswith(("bye", "goodbye", "cya", "see ya", "see you")):
+        return "Goodbye! Come back anytime you have questions about Dorchester."
+    if "who are you" in n or "what are you" in n or "what can you" in n or "what do you do" in n:
+        return (
+            "I'm your Dorchester community assistant. I can help with local events, 311 requests, "
+            "safety data, and neighborhood news. Try “Events this week” or “311 activity” to get started."
+        )
+    if n.startswith("good "):
+        return (
+            "Good to see you! Ask me about Dorchester events, services, safety, or neighborhood trends — "
+            "what's on your mind?"
+        )
+    if n in ("help",) or "what can you help" in n or "how does this work" in n or "how do i use this" in n or n == "what is this":
+        return (
+            "I can answer questions about Dorchester events, 311 service requests, safety trends, "
+            "and community news. Try one of the suggestion chips below, or ask in your own words."
+        )
+    return (
+        "Hi! I'm here to help with Dorchester community questions — events, services, safety, "
+        "and local news. What would you like to know?"
+    )
+
+
+def build_small_talk_result(
+    message: str,
+    retrieval_cache: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    answer = small_talk_response(message)
+    cache = retrieval_cache or create_empty_cache()
+    return {
+        "answer": answer,
+        "mode": "chitchat",
+        "sources": [],
+        "result": {"answer": answer},
+        "retrieval_cache": cache,
+    }
 
 
 def _bootstrap_env() -> None:
@@ -75,6 +189,21 @@ def _get_llm_client():
     if api_key:
         genai.configure(api_key=api_key)
     return genai
+
+
+def _generate_content(model, prompt, generation_config):
+    """Call Gemini with a per-request timeout when the SDK supports it."""
+    global _GEMINI_SUPPORTS_REQUEST_OPTIONS
+    if _GEMINI_SUPPORTS_REQUEST_OPTIONS:
+        try:
+            return model.generate_content(
+                prompt,
+                generation_config=generation_config,
+                request_options={"timeout": GEMINI_REQUEST_TIMEOUT},
+            )
+        except TypeError:
+            _GEMINI_SUPPORTS_REQUEST_OPTIONS = False
+    return model.generate_content(prompt, generation_config=generation_config)
 
 
 def _should_trigger_boston_gov_fallback(answer: str) -> bool:
@@ -112,7 +241,7 @@ def _classify_boston_gov_exact_match(question: str, page_text: str) -> bool:
         return False
 
     client = _get_llm_client()
-    model = client.GenerativeModel(GEMINI_MODEL)
+    model = client.GenerativeModel(GEMINI_FAST_MODEL)
     system_prompt = (
         "You are a relevance classifier.\n"
         "Your task is to decide whether the provided Boston.gov AI answer answers the user's question well enough to be used as the main answer.\n"
@@ -130,7 +259,8 @@ def _classify_boston_gov_exact_match(question: str, page_text: str) -> bool:
     )
 
     try:
-        resp = model.generate_content(
+        resp = _generate_content(
+            model,
             system_prompt + "\n\n" + user_prompt,
             generation_config={"temperature": 0},
         )
@@ -167,7 +297,8 @@ def _regenerate_with_boston_gov_context(question: str, original_answer: str, ai_
         "Please produce a single/combined improved answer for the user:"
     )
     try:
-        resp = model.generate_content(
+        resp = _generate_content(
+            model,
             system_prompt + "\n\n" + user_prompt,
             generation_config={"temperature": 0.2},
         )
@@ -183,6 +314,12 @@ def _regenerate_with_boston_gov_context(question: str, original_answer: str, ai_
 def _build_boston_gov_fallback_answer(question: str, original_answer: str) -> str:
     print("  🏛️ Boston.gov fallback: trigger detected from model answer")
     ai_result = boston_gov.get_boston_gov_ai_answer(question)
+    # Defensive: get_boston_gov_ai_answer should always return a dict, but if a
+    # future change or unexpected path returns something else, never crash the
+    # request — just keep the original answer.
+    if not isinstance(ai_result, dict):
+        print(f"  ⚠️ Boston.gov fallback: unexpected result type {type(ai_result).__name__}; keeping original answer")
+        return original_answer
     ai_text = str(ai_result.get("text", "") or "").strip()
     search_url = ai_result.get("search_url", "")
 
@@ -216,14 +353,21 @@ def _build_boston_gov_fallback_answer(question: str, original_answer: str) -> st
     excerpt = cleaned_ai_text[:2000].strip()
     is_exact_match = _classify_boston_gov_exact_match(question, ai_text)
     if is_exact_match:
-        try:
-            boston_gov.add_boston_gov_answer_to_vectordb(
-                question,
-                cleaned_ai_text,
-                link=primary_link,
-            )
-        except Exception as exc:
-            print(f"  ⚠️ Boston.gov fallback vectordb save failed: {exc}")
+        # Saving to the vector store is a cache-for-next-time side effect and
+        # involves a remote embedding call + a SQLite write. Do it in the
+        # background so the user is not blocked waiting on it; the answer we
+        # return (excerpt) does not depend on the save succeeding.
+        def _save_boston_gov_answer() -> None:
+            try:
+                boston_gov.add_boston_gov_answer_to_vectordb(
+                    question,
+                    cleaned_ai_text,
+                    link=primary_link,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ⚠️ Boston.gov fallback vectordb save failed: {exc}")
+
+        threading.Thread(target=_save_boston_gov_answer, daemon=True).start()
         return excerpt
     print("  ⚠️ Boston.gov fallback: classifier said scraped AI answer is not an exact match")
     return _regenerate_with_boston_gov_context(question, original_answer, cleaned_ai_text)
@@ -232,13 +376,21 @@ def _build_boston_gov_fallback_answer(question: str, original_answer: str) -> st
 def _apply_default_fallback_if_needed(question: str, answer: str) -> str:
     if not _should_trigger_boston_gov_fallback(answer):
         return answer
-    return _build_boston_gov_fallback_answer(question, answer)
+    try:
+        return _build_boston_gov_fallback_answer(question, answer)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ⚠️ Boston.gov fallback failed; returning original answer: {exc}")
+        return answer
 
 
 def _apply_sql_fallback_if_needed(question: str, answer: str) -> str:
     if not _should_trigger_sql_fallback(answer):
         return answer
-    return _build_boston_gov_fallback_answer(question, answer)
+    try:
+        return _build_boston_gov_fallback_answer(question, answer)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ⚠️ Boston.gov fallback failed; returning original answer: {exc}")
+        return answer
 
 
 def _safe_json_loads(text: str, default: Dict[str, Any]) -> Dict[str, Any]:
@@ -402,11 +554,12 @@ def _check_if_needs_new_data(
     default_result = {"needs_new_data": True, "reason": "Error analyzing question, defaulting to new data"}
     
     try:
-        model = client.GenerativeModel(GEMINI_MODEL)
+        model = client.GenerativeModel(GEMINI_FAST_MODEL)
         prompt = f"{system_prompt}\n\n{user_prompt}"
-        resp = model.generate_content(
+        resp = _generate_content(
+            model,
             prompt,
-            generation_config={"temperature": 0}
+            generation_config={"temperature": 0},
         )
         content = (resp.text or "").strip()
         
@@ -541,11 +694,12 @@ def _route_question(question: str) -> Dict[str, Any]:
     }
 
     try:
-        model = client.GenerativeModel(GEMINI_MODEL)
+        model = client.GenerativeModel(GEMINI_FAST_MODEL)
         prompt = f"{system_prompt}\n\n{user_prompt}"
-        resp = model.generate_content(
+        resp = _generate_content(
+            model,
             prompt,
-            generation_config={"temperature": 0}
+            generation_config={"temperature": 0},
         )
         content = (resp.text or "").strip()
         # Remove code fences if present
@@ -607,19 +761,23 @@ def _route_question(question: str) -> Dict[str, Any]:
     }
 
 
-def _compose_rag_answer(question: str, chunks: List[str], metadatas: List[Dict[str, Any]], conversation_history: Optional[List[Dict[str, str]]] = None) -> str:
+def _build_rag_prompt(
+    question: str,
+    chunks: List[str],
+    metadatas: List[Dict[str, Any]],
+    conversation_history: Optional[List[Dict[str, str]]] = None,
+) -> Tuple[Optional[str], List[str]]:
+    """Build the full RAG answer prompt.
+
+    Returns (full_prompt, context_parts). full_prompt is None when there are no
+    chunks. context_parts is kept for the non-streaming fallback.
+    """
     if not chunks:
-        return "No relevant information found."
+        return None, []
 
     context_parts: List[str] = []
-    for idx, (chunk, meta) in enumerate(zip(chunks, metadatas), start=1):
+    for chunk, meta in zip(chunks, metadatas):
         source = meta.get("source", "Unknown")
-        doc_type = meta.get("doc_type", "unknown")
-        tags = meta.get("tags", "")
-        if isinstance(tags, list):
-            tags_str = ", ".join(tags)
-        else:
-            tags_str = str(tags)
         context_parts.append(f"[{source}]")
         context_parts.append(chunk)
         context_parts.append("")
@@ -646,10 +804,6 @@ def _compose_rag_answer(question: str, chunks: List[str], metadatas: List[Dict[s
         "Please answer for the user in clear, everyday language:"
     )
 
-    client = _get_llm_client()
-    model = client.GenerativeModel(GEMINI_MODEL)
-    
-    # Build conversation context
     full_prompt = system_prompt + "\n\n"
     if conversation_history:
         for msg in conversation_history[-10:]:
@@ -657,11 +811,21 @@ def _compose_rag_answer(question: str, chunks: List[str], metadatas: List[Dict[s
             content = msg.get("content", "")
             full_prompt += f"{role.upper()}: {content}\n\n"
     full_prompt += user_prompt
-    
+    return full_prompt, context_parts
+
+
+def _compose_rag_answer(question: str, chunks: List[str], metadatas: List[Dict[str, Any]], conversation_history: Optional[List[Dict[str, str]]] = None) -> str:
+    full_prompt, context_parts = _build_rag_prompt(question, chunks, metadatas, conversation_history)
+    if full_prompt is None:
+        return "No relevant information found."
+
+    client = _get_llm_client()
+    model = client.GenerativeModel(GEMINI_MODEL)
     try:
-        resp = model.generate_content(
+        resp = _generate_content(
+            model,
             full_prompt,
-            generation_config={"temperature": 0.3}
+            generation_config={"temperature": 0.3},
         )
         return (resp.text or "").strip()
     except Exception:
@@ -677,20 +841,38 @@ def _answer_from_history(
     Generate an answer from conversation history and/or cached retrieval data.
     This is used for follow-up questions that can be answered from previous context.
     """
-    has_history = conversation_history and len(conversation_history) > 0
-    has_cache = retrieval_cache and retrieval_cache.get("mode")
-    
-    if not has_history and not has_cache:
+    full_prompt = _build_history_prompt(question, conversation_history, retrieval_cache)
+    if full_prompt is None:
         return "I don't have any previous conversation or data to reference. Could you ask your question again?"
-    
+
     client = _get_llm_client()
     model = client.GenerativeModel(GEMINI_MODEL)
-    
-    # Build the context from cache
+    try:
+        resp = _generate_content(
+            model,
+            full_prompt,
+            generation_config={"temperature": 0.3},
+        )
+        return (resp.text or "").strip()
+    except Exception:
+        return "I encountered an error answering from the available information. Could you rephrase your question?"
+
+
+def _build_history_prompt(
+    question: str,
+    conversation_history: Optional[List[Dict[str, str]]] = None,
+    retrieval_cache: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Build the full 'answer from history/cache' prompt, or None if no data."""
+    has_history = conversation_history and len(conversation_history) > 0
+    has_cache = retrieval_cache and retrieval_cache.get("mode")
+    if not has_history and not has_cache:
+        return None
+
     cache_context = ""
     if has_cache:
         cache_context = _build_cache_context_for_answer(retrieval_cache)
-    
+
     system_prompt = (
         "You are a friendly, non-technical assistant helping people understand Dorchester community data and policies.\n"
         "This system is configured for DORCHESTER ONLY. All data queries are automatically filtered to Dorchester only.\n"
@@ -705,8 +887,7 @@ def _answer_from_history(
         "closely related information from the available context if it helps.\n"
         "Avoid technical jargon, and do not mention SQL, databases, RAG, retrieval methods, or internal tools."
     )
-    
-    # Build conversation context
+
     history_text = ""
     if conversation_history:
         for msg in conversation_history[-20:]:  # Last 20 messages for context
@@ -714,7 +895,7 @@ def _answer_from_history(
             content = msg.get("content", "")
             if role and content:
                 history_text += f"{role.upper()}: {content}\n\n"
-    
+
     user_prompt = ""
     if history_text:
         user_prompt += "Conversation History:\n" + history_text + "\n\n"
@@ -722,16 +903,8 @@ def _answer_from_history(
         user_prompt += "Available Data (from recent retrieval):\n" + cache_context + "\n\n"
     user_prompt += "Current Question: " + question + "\n\n"
     user_prompt += "Please answer the current question using the available information:"
-    
-    try:
-        full_prompt = system_prompt + "\n\n" + user_prompt
-        resp = model.generate_content(
-            full_prompt,
-            generation_config={"temperature": 0.3}
-        )
-        return (resp.text or "").strip()
-    except Exception:
-        return "I encountered an error answering from the available information. Could you rephrase your question?"
+
+    return system_prompt + "\n\n" + user_prompt
 
 
 def _build_cache_context_for_answer(cache: Dict[str, Any]) -> str:
@@ -874,12 +1047,15 @@ def _should_include_rss(question: str, folder_categories: Optional[List[str]]) -
     return "newsletters" in normalized or _looks_like_rss_query(question)
 
 
-def _run_rag(
+def _retrieve_rag(
     question: str,
     plan: Dict[str, Any],
-    conversation_history: Optional[List[Dict[str, str]]] = None,
-    apply_fallback: bool = True,
-) -> Dict[str, Any]:
+) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """Run all RAG retrieval sources (concurrently when enabled).
+
+    Returns (combined_chunks, combined_meta). Kept separate from answer
+    composition so the streaming path can retrieve, then stream the answer.
+    """
     k = int(plan.get("k", 5))
     tags = plan.get("transcript_tags")
     sources = plan.get("policy_sources")
@@ -888,52 +1064,70 @@ def _run_rag(
     combined_chunks: List[str] = []
     combined_meta: List[Dict[str, Any]] = []
 
-    if _should_include_rss(question, folders):
-        try:
-            rss_res = retrieval.retrieve_rss(question, k=k)
-            rss_chunks = rss_res.get("chunks", [])
-            print(f"  📰 RSS: {len(rss_chunks)} chunks found")
-            combined_chunks.extend(rss_chunks)
-            combined_meta.extend(rss_res.get("metadata", []))
-        except Exception as e:
-            print(f"  ⚠️ RSS retrieval error: {e}")
+    # Each retrieval source is independent, so run them concurrently. Returns
+    # (label, chunks, metadata). These mostly wait on network (embeddings) and
+    # the vector store, so threads give real concurrency.
+    def _task_rss():
+        rss_res = retrieval.retrieve_rss(question, k=k)
+        return ("📰 RSS", rss_res.get("chunks", []), rss_res.get("metadata", []))
 
-    # cached Boston.gov answers are a regular RAG source; search them on every RAG pass.
-    try:
+    def _task_boston():
         boston_res = retrieval.retrieve(question, k=k, doc_type="boston_gov_answer")
-        boston_chunks = boston_res.get("chunks", [])
-        print(f"  🏛️ BostonGov: {len(boston_chunks)} chunks found")
-        combined_chunks.extend(boston_chunks)
-        combined_meta.extend(boston_res.get("metadata", []))
-    except Exception as e:
-        print(f"  ⚠️ BostonGov retrieval error: {e}")
+        return ("🏛️ BostonGov", boston_res.get("chunks", []), boston_res.get("metadata", []))
 
-    # transcripts
-    try:
+    def _task_transcripts():
         t_res = retrieval.retrieve_transcripts(question, tags=tags, k=k)
-        t_chunks = t_res.get("chunks", [])
-        print(f"  📝 Transcripts: {len(t_chunks)} chunks found")
-        combined_chunks.extend(t_chunks)
-        combined_meta.extend(t_res.get("metadata", []))
-    except Exception as e:
-        print(f"  ⚠️ Transcript retrieval error: {e}")
+        return ("📝 Transcripts", t_res.get("chunks", []), t_res.get("metadata", []))
 
-    # policies
-    try:
+    def _task_policies():
+        chunks: List[str] = []
+        meta: List[Dict[str, Any]] = []
         if sources:
             for src in sources:
                 p_res = retrieval.retrieve_policies(question, k=k, source=src)
-                combined_chunks.extend(p_res.get("chunks", []))
-                combined_meta.extend(p_res.get("metadata", []))
+                chunks.extend(p_res.get("chunks", []))
+                meta.extend(p_res.get("metadata", []))
         else:
             p_res = retrieval.retrieve_policies(question, k=k)
-            p_chunks = p_res.get("chunks", [])
-            print(f"  📋 Policies: {len(p_chunks)} chunks found")
-            combined_chunks.extend(p_chunks)
-            combined_meta.extend(p_res.get("metadata", []))
-    except Exception as e:
-        print(f"  ⚠️ Policy retrieval error: {e}")
+            chunks = p_res.get("chunks", [])
+            meta = p_res.get("metadata", [])
+        return ("📋 Policies", chunks, meta)
 
+    # Fixed order so combined results are deterministic regardless of which task
+    # finishes first.
+    tasks = []
+    if _should_include_rss(question, folders):
+        tasks.append(_task_rss)
+    tasks.extend([_task_boston, _task_transcripts, _task_policies])
+
+    def _safe_run(fn):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            print(f"  ⚠️ Retrieval task error: {e}")
+            return ("(failed)", [], [])
+
+    if _PARALLEL_RETRIEVAL and len(tasks) > 1:
+        with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+            results = list(executor.map(_safe_run, tasks))
+    else:
+        results = [_safe_run(fn) for fn in tasks]
+
+    for label, chunks, meta in results:
+        print(f"  {label}: {len(chunks)} chunks found")
+        combined_chunks.extend(chunks)
+        combined_meta.extend(meta)
+
+    return combined_chunks, combined_meta
+
+
+def _run_rag(
+    question: str,
+    plan: Dict[str, Any],
+    conversation_history: Optional[List[Dict[str, str]]] = None,
+    apply_fallback: bool = True,
+) -> Dict[str, Any]:
+    combined_chunks, combined_meta = _retrieve_rag(question, plan)
     answer = _compose_rag_answer(question, combined_chunks, combined_meta, conversation_history)
     if apply_fallback:
         answer = _apply_default_fallback_if_needed(question, answer)
@@ -947,6 +1141,15 @@ def _run_sql(
 ) -> Dict[str, Any]:
     # Import app4 (MySQL) only when SQL path is actually used
     import sql_chat.app4 as app4  # noqa: WPS433
+
+    if app4.is_generic_events_list_question(question):
+        try:
+            out = app4.run_generic_events_query(question, conversation_history)
+            if apply_fallback:
+                out["answer"] = _apply_sql_fallback_if_needed(question, out.get("answer", ""))
+            return out
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ⚠️ Fast events path failed ({exc}); falling back to LLM SQL")
 
     database = os.environ.get("PGSCHEMA", "public")
     schema = app4._fetch_schema_snapshot(database)
@@ -985,7 +1188,29 @@ def _run_sql(
             metadata = json.dumps(meta_obj, ensure_ascii=False)
         except Exception:
             pass
-    sql = app4._llm_generate_sql(question, schema, os.getenv("GEMINI_MODEL", getattr(app4, "GEMINI_MODEL", GEMINI_MODEL)), metadata, conversation_history)
+    try:
+        sql = app4._llm_generate_sql(
+            question,
+            schema,
+            os.getenv("GEMINI_MODEL", getattr(app4, "GEMINI_MODEL", GEMINI_MODEL)),
+            metadata,
+            conversation_history,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ⚠️ SQL generation failed: {exc}")
+        if app4.is_generic_events_list_question(question):
+            out = app4.run_generic_events_query(question, conversation_history)
+            if apply_fallback:
+                out["answer"] = _apply_sql_fallback_if_needed(question, out.get("answer", ""))
+            return out
+        return {
+            "answer": (
+                "I'm having trouble reaching the AI service right now. "
+                "Please try again in a moment."
+            ),
+            "sql": "",
+            "result": {"columns": [], "rows": [], "error": str(exc)},
+        }
     exec_out = app4._execute_with_retries(
         initial_sql=sql,
         question=question,
@@ -994,25 +1219,53 @@ def _run_sql(
     )
     final_sql = exec_out.get("sql", sql)
     result = exec_out.get("result", {})
-    answer = app4._llm_generate_answer(
-        question,
-        final_sql,
-        result,
-        os.getenv("GEMINI_SUMMARY_MODEL", getattr(app4, "GEMINI_SUMMARY_MODEL", GEMINI_SUMMARY_MODEL)),
-        conversation_history,
-    )
+    try:
+        answer = app4._llm_generate_answer(
+            question,
+            final_sql,
+            result,
+            os.getenv("GEMINI_SUMMARY_MODEL", getattr(app4, "GEMINI_SUMMARY_MODEL", GEMINI_SUMMARY_MODEL)),
+            conversation_history,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ⚠️ Answer generation failed: {exc}")
+        if app4.is_generic_events_list_question(question):
+            answer = app4._format_events_answer_fallback(question, result)
+        else:
+            answer = (
+                "I'm having trouble generating a response right now. "
+                "Please try again in a moment."
+            )
     if apply_fallback:
         answer = _apply_sql_fallback_if_needed(question, answer)
     return {"answer": answer, "sql": final_sql, "result": result}
 
 
-def _run_hybrid(question: str, plan: Dict[str, Any], conversation_history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+def _run_hybrid_parts(
+    question: str,
+    plan: Dict[str, Any],
+    conversation_history: Optional[List[Dict[str, str]]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Run the SQL and RAG halves of a hybrid query (concurrently when enabled)."""
+    # SQL and RAG are independent. SQL uses its own thread-local DB connection
+    # and RAG uses the shared (read-only) vector store, so this is safe.
+    if _PARALLEL_RETRIEVAL:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            sql_future = executor.submit(_run_sql, question, conversation_history, False)
+            rag_future = executor.submit(_run_rag, question, plan, conversation_history, False)
+            return sql_future.result(), rag_future.result()
     sql_part = _run_sql(question, conversation_history, apply_fallback=False)
     rag_part = _run_rag(question, plan, conversation_history, apply_fallback=False)
+    return sql_part, rag_part
 
-    # Merge with a short LLM call
-    client = _get_llm_client()
-    model = client.GenerativeModel(GEMINI_MODEL)
+
+def _build_hybrid_merge_prompt(
+    question: str,
+    sql_part: Dict[str, Any],
+    rag_part: Dict[str, Any],
+    conversation_history: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    """Build the hybrid merge prompt that blends the SQL and RAG answers."""
     merge_system = (
         "You are a friendly, non-technical assistant explaining information about DORCHESTER ONLY to a general audience.\n"
         "This system is configured for DORCHESTER ONLY. All data queries are automatically filtered to Dorchester only.\n"
@@ -1039,8 +1292,6 @@ def _run_hybrid(question: str, plan: Dict[str, Any], conversation_history: Optio
         "Question:\n" + question + "\n\n" +
         "Inputs (JSON):\n" + json.dumps(blob, ensure_ascii=False, default=str)
     )
-    
-    # Build full prompt with conversation history
     full_prompt = merge_system + "\n\n"
     if conversation_history:
         for msg in conversation_history[-10:]:
@@ -1048,11 +1299,20 @@ def _run_hybrid(question: str, plan: Dict[str, Any], conversation_history: Optio
             content = msg.get("content", "")
             full_prompt += f"{role.upper()}: {content}\n\n"
     full_prompt += merge_user
-    
+    return full_prompt
+
+
+def _run_hybrid(question: str, plan: Dict[str, Any], conversation_history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+    sql_part, rag_part = _run_hybrid_parts(question, plan, conversation_history)
+    full_prompt = _build_hybrid_merge_prompt(question, sql_part, rag_part, conversation_history)
+
+    client = _get_llm_client()
+    model = client.GenerativeModel(GEMINI_MODEL)
     try:
-        resp = model.generate_content(
+        resp = _generate_content(
+            model,
             full_prompt,
-            generation_config={"temperature": 0}
+            generation_config={"temperature": 0},
         )
         answer = (resp.text or "").strip()
     except Exception:
@@ -1060,6 +1320,184 @@ def _run_hybrid(question: str, plan: Dict[str, Any], conversation_history: Optio
 
     answer = _apply_default_fallback_if_needed(question, answer)
     return {"answer": answer, "sql": sql_part, "rag": rag_part}
+
+
+def _stream_model_text(model_name: str, prompt: str, temperature: float):
+    """Yield text deltas from a streaming Gemini generation. Defensive on errors."""
+    client = _get_llm_client()
+    model = client.GenerativeModel(model_name)
+    try:
+        try:
+            stream = model.generate_content(
+                prompt,
+                generation_config={"temperature": temperature},
+                stream=True,
+                request_options={"timeout": GEMINI_REQUEST_TIMEOUT},
+            )
+        except TypeError:
+            stream = model.generate_content(
+                prompt,
+                generation_config={"temperature": temperature},
+                stream=True,
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ⚠️ Streaming generation failed to start: {exc}")
+        return
+    for chunk in stream:
+        try:
+            piece = getattr(chunk, "text", "") or ""
+        except Exception:  # noqa: BLE001
+            piece = ""
+        if piece:
+            yield piece
+
+
+def _pseudo_stream(text: str):
+    """Emit an already-computed answer in word chunks for progressive rendering."""
+    if not text:
+        return
+    words = text.split(" ")
+    for i, word in enumerate(words):
+        yield word if i == 0 else " " + word
+
+
+def stream_agent_response(
+    message: str,
+    conversation_history: Optional[List[Dict[str, str]]] = None,
+    retrieval_cache: Optional[Dict[str, Any]] = None,
+):
+    """Stream an agent answer.
+
+    Yields ('delta', text) chunks as the answer is produced, then exactly one
+    ('final', payload) where payload = {answer, mode, result, retrieval_cache}.
+
+    This mirrors `_execute_agent_response`'s routing/caching decisions but
+    streams the final generation. The RAG / hybrid / history answers are truly
+    token-streamed from Gemini; SQL answers are computed then emitted
+    progressively. The Boston.gov post-hoc fallback is intentionally skipped
+    here (it requires inspecting the complete answer first).
+    """
+    cache = retrieval_cache or create_empty_cache()
+
+    if is_small_talk(message):
+        answer = small_talk_response(message)
+        yield ("delta", answer)
+        yield ("final", {
+            "answer": answer,
+            "mode": "chitchat",
+            "result": {"answer": answer},
+            "retrieval_cache": cache,
+        })
+        return
+
+    has_history = bool(conversation_history)
+    has_cache = bool(cache and cache.get("mode"))
+
+    if has_history or has_cache:
+        history_check = _check_if_needs_new_data(message, conversation_history, cache)
+    else:
+        history_check = {"needs_new_data": True}
+
+    # Follow-up that can be answered from history/cache.
+    if not history_check.get("needs_new_data", True) and (has_history or has_cache):
+        prompt = _build_history_prompt(message, conversation_history, cache)
+        if prompt is None:
+            answer = "I don't have any previous conversation or data to reference. Could you ask your question again?"
+            yield ("delta", answer)
+        else:
+            acc: List[str] = []
+            for piece in _stream_model_text(GEMINI_MODEL, prompt, 0.3):
+                acc.append(piece)
+                yield ("delta", piece)
+            answer = "".join(acc).strip()
+            if not answer:
+                answer = "I encountered an error answering from the available information. Could you rephrase your question?"
+                yield ("delta", answer)
+        yield ("final", {"answer": answer, "mode": "history", "result": {"answer": answer}, "retrieval_cache": cache})
+        return
+
+    plan = _route_question(message)
+    mode = plan.get("mode", "hybrid")
+
+    if mode == "sql":
+        try:
+            out = _run_sql(message, conversation_history)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ⚠️ SQL pipeline failed: {exc}")
+            answer = (
+                "I couldn't load that information right now. "
+                "Please try again in a moment."
+            )
+            yield ("delta", answer)
+            yield ("final", {
+                "answer": answer,
+                "mode": "sql",
+                "result": {"answer": answer, "error": str(exc)},
+                "retrieval_cache": cache,
+            })
+            return
+        answer = out.get("answer", "")
+        for piece in _pseudo_stream(answer):
+            yield ("delta", piece)
+        next_cache = build_retrieval_cache(
+            mode="sql", question=message, answer=answer,
+            sql_result=out.get("result"), sql_query=out.get("sql"),
+        )
+        yield ("final", {"answer": answer, "mode": "sql", "result": out, "retrieval_cache": next_cache})
+        return
+
+    if mode == "rag":
+        chunks, meta = _retrieve_rag(message, plan)
+        prompt, context_parts = _build_rag_prompt(message, chunks, meta, conversation_history)
+        if prompt is None:
+            answer = "No relevant information found."
+            yield ("delta", answer)
+        else:
+            acc = []
+            for piece in _stream_model_text(GEMINI_MODEL, prompt, 0.3):
+                acc.append(piece)
+                yield ("delta", piece)
+            answer = "".join(acc).strip()
+            if not answer:
+                answer = "\n\n".join(context_parts[:10])
+                yield ("delta", answer)
+        result = {"answer": answer, "chunks": chunks, "metadata": meta}
+        next_cache = build_retrieval_cache(
+            mode="rag", question=message, answer=answer,
+            rag_chunks=chunks, rag_metadata=meta,
+        )
+        yield ("final", {"answer": answer, "mode": "rag", "result": result, "retrieval_cache": next_cache})
+        return
+
+    # hybrid
+    sql_part, rag_part = _run_hybrid_parts(message, plan, conversation_history)
+    prompt = _build_hybrid_merge_prompt(message, sql_part, rag_part, conversation_history)
+    acc = []
+    for piece in _stream_model_text(GEMINI_MODEL, prompt, 0):
+        acc.append(piece)
+        yield ("delta", piece)
+    answer = "".join(acc).strip()
+    if not answer:
+        answer = (sql_part.get("answer") or "") + "\n\n" + (rag_part.get("answer") or "")
+        yield ("delta", answer)
+    result = {"answer": answer, "sql": sql_part, "rag": rag_part}
+    next_cache = build_retrieval_cache(
+        mode="hybrid", question=message, answer=answer,
+        sql_result=sql_part.get("result"), sql_query=sql_part.get("sql"),
+        rag_chunks=rag_part.get("chunks"), rag_metadata=rag_part.get("metadata"),
+    )
+    yield ("final", {"answer": answer, "mode": "hybrid", "result": result, "retrieval_cache": next_cache})
+
+
+def apply_post_stream_fallback(question: str, answer: str, mode: str) -> str:
+    """Apply Boston.gov fallback after streaming completes (mirrors non-streaming path)."""
+    if not answer:
+        return answer
+    if mode == "sql":
+        return _apply_sql_fallback_if_needed(question, answer)
+    if mode in {"rag", "hybrid", "history"}:
+        return _apply_default_fallback_if_needed(question, answer)
+    return answer
 
 
 def _ensure_gemini_ready() -> None:
