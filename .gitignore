@@ -29,9 +29,10 @@ llm_query_log.csv
 logs/
 *.sqlite
 *.db
+**/chroma.sqlite3
 vectordb_new/
 on_the_porch/vectordb_new/
-on_the_porch/vectordb_new/*.sqlite3
+**/vectordb_new.zip
 
 
 # 5️⃣ Flask & Gunicorn Deployment Files
@@ -103,7 +104,6 @@ on_the_porch/rag_stuff/data/*
 !api/datastore/Boston Anti-Displacement Plan Analysis.txt
 !api/*.sql
 !setup/*.sql
-/on_the_porch/vectordb_new
 on_the_porch/data_ingestion/gmail_token.json
 on_the_porch/data_ingestion/gmail_credentials.json
 on_the_porch/data_ingestion/.email_sync_state.json
